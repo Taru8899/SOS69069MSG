@@ -1,4 +1,4 @@
-# SOS 69069 Privacy Messaging Client
+# SOS69069 MSG Privacy Messaging Client
 
 Python implementation of the full architecture:
 
