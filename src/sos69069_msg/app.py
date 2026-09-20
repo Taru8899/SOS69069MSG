@@ -27,6 +27,7 @@ from .logo import logo_bytes
 from .message_engine import prepare_and_sign, short_code
 from .reader import Inbox, sync
 from .relayer import parse_record, submit
+from .etherscan import EtherscanClient
 from .rpc import RpcClient
 from .submission import build_record_signature_call
 from .ethcrypto import KeyPair
@@ -215,6 +216,8 @@ class SOS69069MsgApp(toga.App):
         self.seed_in = _input(placeholder="Paste 64-hex seed to import")
         self.conv_out = _panel(130)
         self.rpc_in = _input(value=self.settings["rpc_url"])
+        self.es_in = _input(value=self.settings.get("etherscan_key", ""),
+                            placeholder="Etherscan API key (for CHECK)")
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
         self.net_status = _label("", muted=False, size=15, bold=True)
         self.copy_status = _label("", muted=False, size=14)
@@ -237,6 +240,11 @@ class SOS69069MsgApp(toga.App):
                 lambda: self.conv.rendezvous_d if self.conv else "", "D", self.copy_status),
                 primary=False),
             _title("Network"),
+            _label("Etherscan API key: CHECK reads messages through Etherscan (more reliable "
+                   "than a public RPC). Stored only on this phone.", size=14),
+            self.es_in,
+            _label("RPC URL: used for SEND / RELAY (sending transactions) and as CHECK's fallback.",
+                   size=14),
             self.rpc_in,
             _label("Max gas fee (gwei)", size=14),
             self.cap_in,
@@ -338,7 +346,7 @@ class SOS69069MsgApp(toga.App):
 
     # ------------------------------------------------------------------ settings / seed
     def _load_settings(self):
-        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI}
+        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI, "etherscan_key": ""}
         if self.settings_file.exists():
             try:
                 s.update(json.loads(self.settings_file.read_text()))
@@ -355,14 +363,25 @@ class SOS69069MsgApp(toga.App):
             cap = float(self.cap_in.value)
             if cap <= 0:
                 raise ValueError("cap must be > 0")
-            self.settings = {"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap}
+            self.settings.update({"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap,
+                                  "etherscan_key": self.es_in.value.strip()})
             self._save_settings()
-            self.net_status.text = "Saved ✔"
+            self.net_status.text = ("Saved ✔ CHECK will use Etherscan." if self.settings["etherscan_key"]
+                                    else "Saved ✔ (no Etherscan key: CHECK uses the RPC.)")
         except Exception as e:
             self.net_status.text = f"Error: {e}"
 
     def _rpc(self) -> RpcClient:
         return RpcClient(self.settings["rpc_url"])
+
+    def _check_sources(self):
+        """Backends for CHECK, best first: Etherscan (if a key is set), then the RPC."""
+        out = []
+        key = (self.settings.get("etherscan_key") or "").strip()
+        if key:
+            out.append(("Etherscan", lambda: EtherscanClient(key, CHAIN_ID)))
+        out.append(("RPC", self._rpc))
+        return out
 
     def _load_seed(self):
         if self.seed_file.exists():
@@ -466,18 +485,30 @@ class SOS69069MsgApp(toga.App):
                 # always re-reads recent history (not only last_block+1).
                 self.inbox.last_block = None
 
-            rpc, inbox = self._rpc(), self.inbox
-            new = await asyncio.to_thread(sync, rpc, d, inbox, frm, progress)
+            inbox = self.inbox
+            errors, used, new = [], None, 0
+            for name, make in self._check_sources():
+                try:
+                    new = await asyncio.to_thread(sync, make(), d, inbox, frm, progress)
+                    used = name
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    errors.append(msg if msg.lower().startswith(name.lower()) else f"{name}: {msg}")
+            if used is None:
+                hint = ("" if (self.settings.get("etherscan_key") or "").strip() else
+                        "\nTip: add an Etherscan API key in SETUP → Network.")
+                raise RuntimeError(" | ".join(errors) + hint)
             mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
             self.messages_out.value = inbox.render(d, mine)
             total = len(inbox.messages) + len(inbox.pending())
             if total == 0:
                 self.check_status.text = (
-                    "0 messages · block %s\nNo SignatureRecorded with intendedTo = this address yet."
-                ) % (inbox.last_block,)
+                    "0 messages · block %s · via %s\nNo SignatureRecorded with intendedTo = this address yet."
+                ) % (inbox.last_block, used)
             else:
-                self.check_status.text = "%s new · %s total · block %s" % (
-                    new, total, inbox.last_block)
+                self.check_status.text = "%s new · %s total · block %s · via %s" % (
+                    new, total, inbox.last_block, used)
         except Exception as e:
             self.check_status.text = "Error: %s: %s" % (type(e).__name__, e)
         finally:

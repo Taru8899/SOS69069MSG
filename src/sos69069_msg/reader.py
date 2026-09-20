@@ -22,7 +22,7 @@ OVERLAP = 20
 DEFAULT_LOOKBACK = 1_000_000
 MIN_CHUNK = 1_000
 _RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "max",
-                "results", "10000", "query returned", "more than")
+                "results", "10000", "query returned", "more than", "smaller", "dataset", "window")
 
 
 def short(addr: str) -> str:
@@ -66,6 +66,8 @@ def _addr_from_topic(topic: str) -> str:
 
 def _is_range_error(err: Exception) -> bool:
     m = str(err).lower()
+    if "rate limit" in m or "api key" in m or "apikey" in m:   # not a range problem: don't shrink
+        return False
     return any(h in m for h in _RANGE_HINTS)
 
 
