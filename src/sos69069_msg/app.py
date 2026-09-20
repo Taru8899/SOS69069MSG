@@ -8,11 +8,12 @@ import asyncio
 import json
 import os
 import secrets
+import traceback
 from pathlib import Path
 
 import toga
 from toga.style import Pack
-from toga.style.pack import COLUMN
+from toga.style.pack import COLUMN, ROW, NONE, PACK
 
 from .address_factory import AddressFactory, generate_seed
 from .config import CHAIN_ID, CONTRACT_ADDRESS
@@ -47,26 +48,26 @@ def _from_hex(s: str) -> bytes:
 
 class SOS69069MsgApp(toga.App):
     def startup(self):
-        """Protected entry — any crash is shown on screen instead of silent exit."""
         try:
-            self._real_startup()
-        except Exception as e:
-            import traceback
-            err = traceback.format_exc()
-            try:
-                log = Path(getattr(self.paths, "data", ".") or ".") / "crash.txt"
-                log.parent.mkdir(parents=True, exist_ok=True)
-                log.write_text(err)
-            except Exception:
-                pass
-            self.main_window = toga.MainWindow(title="Startup Crash")
-            box = toga.Box(style=Pack(direction=COLUMN, margin=10))
-            box.add(toga.Label("The app crashed during startup. Share this error:"))
-            box.add(toga.MultilineTextInput(value=err, readonly=True, style=Pack(flex=1, height=400)))
-            self.main_window.content = box
-            self.main_window.show()
+            self._build()
+        except Exception:
+            self._show_error(traceback.format_exc())
 
-    def _real_startup(self):
+    def _show_error(self, text: str):
+        """Never crash silently: show the traceback on screen (and save it to crash.log)."""
+        try:
+            (Path(self.paths.data) / "crash.log").write_text(text)
+        except Exception:
+            pass
+        box = toga.Box(style=Pack(direction=COLUMN), children=[
+            toga.Label("sos69069 msg failed to start. Screenshot this and send it:"),
+            toga.MultilineTextInput(readonly=True, value=text, style=Pack(flex=1)),
+        ])
+        self.main_window = toga.MainWindow(title=self.formal_name)
+        self.main_window.content = box
+        self.main_window.show()
+
+    def _build(self):
         self.data_dir = Path(self.paths.data)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.seed_file = self.data_dir / "seed.hex"
@@ -147,16 +148,27 @@ class SOS69069MsgApp(toga.App):
             self.relay_status,
         ])
 
-        tabs = toga.OptionContainer(content=[
-            toga.OptionItem("Setup", toga.ScrollContainer(content=setup, horizontal=False)),
-            toga.OptionItem("Send", toga.ScrollContainer(content=send, horizontal=False)),
-            toga.OptionItem("Inbox", toga.ScrollContainer(content=inbox, horizontal=False)),
-            toga.OptionItem("Relay", toga.ScrollContainer(content=relay, horizontal=False)),
-        ])
+        # Simple button navigation (avoids the Android OptionContainer); each tab is its own
+        # ScrollContainer and inactive ones are hidden with display=none.
+        self.tabs = {}
+        for i, (name, box) in enumerate([("Setup", setup), ("Send", send),
+                                         ("Inbox", inbox), ("Relay", relay)]):
+            self.tabs[name] = toga.ScrollContainer(
+                content=box, horizontal=False,
+                style=Pack(flex=1, display=PACK if i == 0 else NONE))
+        nav = toga.Box(style=Pack(direction=ROW), children=[
+            toga.Button(name, on_press=self._nav(name), style=Pack(flex=1)) for name in self.tabs])
+        root = toga.Box(style=Pack(direction=COLUMN), children=[nav, *self.tabs.values()])
         self.main_window = toga.MainWindow(title=self.formal_name)
-        self.main_window.content = tabs
+        self.main_window.content = root
         self.main_window.show()
         self._refresh_seed_status()
+
+    def _nav(self, name):
+        def handler(widget, **kwargs):
+            for n, sc in self.tabs.items():
+                sc.style.display = PACK if n == name else NONE
+        return handler
 
     # ------------------------------------------------------------ settings
     def _load_settings(self):
