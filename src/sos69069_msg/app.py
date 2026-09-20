@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 import traceback
 from pathlib import Path
 
@@ -129,6 +130,8 @@ class SOS69069MsgApp(toga.App):
         self.settings_file = self.data_dir / "settings.json"
         self.mgr = self.conv = self.secret = self.inbox = self.relayer = None
         self.last_tx_link = ""
+        self._refreshing = False
+        self._last_auto = 0.0
         self.settings = self._load_settings()
         self._load_seed()
 
@@ -142,6 +145,10 @@ class SOS69069MsgApp(toga.App):
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
         self.net_status = _label("", muted=False)
         self.copy_status = _label("", muted=False)
+        self.keep_relayer_sw = toga.Switch(
+            "Keep relayer from previous conversation", value=bool(self.settings.get("keep_relayer")),
+            on_change=self.on_keep_relayer,
+            style=_pack(pad=(6, 16, 2, 16), color=TXT, background_color=BG))
 
         setup = _col([
             _title("1. Identity"),
@@ -161,6 +168,9 @@ class SOS69069MsgApp(toga.App):
             _button("Copy secret", self._copier(lambda: self.secret_in.value, "secret", self.copy_status),
                     primary=False),
             _title("3. Conversation"),
+            self.keep_relayer_sw,
+            _label("Off: every NEW conversation gets a fresh relayer address (better privacy, "
+                   "you fund it again). On: reuse the relayer you already funded."),
             _button("Start conversation", self.start_conversation),
             self.conv_out,
             _button("Copy D address", self._copier(lambda: self.conv.rendezvous_d, "D address",
@@ -208,6 +218,7 @@ class SOS69069MsgApp(toga.App):
 
         # ---------------- Relay ----------------
         self.relayer_in = _input()
+        self.relayer_note = _label("", size=13)
         self.balance_label = _label("", muted=False)
         self.relay_in = toga.MultilineTextInput(
             placeholder="Paste a signed record JSON here",
@@ -216,6 +227,7 @@ class SOS69069MsgApp(toga.App):
         relay = _col([
             _label("Your relayer address. Send it a little ETH; it pays gas:"),
             self.relayer_in,
+            self.relayer_note,
             _button("Copy relayer address", self._copier(lambda: self.relayer_in.value,
                                                          "relayer address", self.balance_label),
                     primary=False),
@@ -293,13 +305,15 @@ class SOS69069MsgApp(toga.App):
         return _col([top, tabs])
 
     def _go(self, name):
-        def handler(widget, **kwargs):
+        async def handler(widget, **kwargs):
             self.main_window.content = self.pages[name]
+            if name == "Inbox" and self.conv and time.monotonic() - self._last_auto > 15:
+                await self.refresh_inbox(None, auto=True)   # latest messages to D, automatically
         return handler
 
     # ------------------------------------------------------------ settings
     def _load_settings(self):
-        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI}
+        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI, "keep_relayer": False}
         if self.settings_file.exists():
             try:
                 s.update(json.loads(self.settings_file.read_text()))
@@ -307,14 +321,17 @@ class SOS69069MsgApp(toga.App):
                 pass
         return s
 
+    def _save_settings(self):
+        self.settings_file.write_text(json.dumps(self.settings))
+
     def save_network(self, widget, **kwargs):
         try:
             RpcClient(self.rpc_in.value)  # validates https
             cap = float(self.cap_in.value)
             if cap <= 0:
                 raise ValueError("cap must be > 0")
-            self.settings = {"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap}
-            self.settings_file.write_text(json.dumps(self.settings))
+            self.settings.update({"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap})
+            self._save_settings()
             self.net_status.text = "Saved ✔"
         except Exception as e:
             self.net_status.text = f"Error: {e}"
@@ -338,7 +355,11 @@ class SOS69069MsgApp(toga.App):
                 pass
         factory = AddressFactory(seed, str(self.data_dir / "signer_counter.json"))
         self.mgr = ConversationManager(factory)
-        self.relayer = factory.relayer_key()
+        if save:  # a brand-new identity: old relayer choices refer to the old seed
+            for k in ("relayer_for", "relayer_index", "next_relayer"):
+                self.settings.pop(k, None)
+            self._save_settings()
+        self.relayer = factory.relayer_key(self.settings.get("relayer_index", 0))
         self.conv = self.inbox = None
 
     def _refresh_seed_status(self):
@@ -362,6 +383,36 @@ class SOS69069MsgApp(toga.App):
             return
         self._refresh_seed_status()
 
+    # ------------------------------------------------------------ relayer
+    def on_keep_relayer(self, widget, **kwargs):
+        self.settings["keep_relayer"] = bool(self.keep_relayer_sw.value)
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def _select_relayer(self, conv):
+        """Pick the relayer for this conversation: remembered one, kept one, or a fresh one."""
+        cid = conv.conversation_id.hex()
+        mapping = self.settings.setdefault("relayer_for", {})
+        if cid in mapping:
+            idx, note = mapping[cid], "Same relayer as before for this conversation."
+        elif not mapping:
+            idx, note = 0, "Your first relayer."
+        elif self.keep_relayer_sw.value:
+            idx = self.settings.get("relayer_index", 0)
+            note = "Kept from your previous conversation."
+        else:
+            idx = self.settings.get("next_relayer", 1)
+            self.settings["next_relayer"] = idx + 1
+            note = "Fresh relayer for this new conversation. Fund it to submit."
+        mapping[cid] = idx
+        self.settings["relayer_index"] = idx
+        self._save_settings()
+        self.relayer = self.mgr.factory.relayer_key(idx)
+        self.relayer_in.value = self.relayer.address
+        self.relayer_note.text = f"Relayer #{idx}. {note}"
+
     # ------------------------------------------------------ secret / conv
     def gen_secret(self, widget, **kwargs):
         self.secret_in.value = secrets.token_bytes(32).hex()
@@ -374,12 +425,15 @@ class SOS69069MsgApp(toga.App):
             self.conv = self.mgr.start_conversation(secret)
             self.secret = secret
             self.inbox = Inbox(str(self.data_dir / f"inbox_{self.conv.rendezvous_d[2:10]}.json"))
-            self.inbox_out.value = self.inbox.render()
+            self._select_relayer(self.conv)
+            self.inbox_out.value = self._render_inbox()
             self.conv_out.value = (
                 f"Rendezvous D:\n{self.conv.rendezvous_d}\n\n"
                 f"Chain: Ethereum mainnet ({CHAIN_ID})\nContract: {CONTRACT_ADDRESS}\n\n"
-                "Conversation ready ✔ Open the Send tab."
+                "Conversation ready ✔ Open the Send tab.\n"
+                f"{self.relayer_note.text}"
             )
+            self._kick_refresh()
         except Exception as e:
             self.conv_out.value = f"Error: {e}"
 
@@ -409,21 +463,44 @@ class SOS69069MsgApp(toga.App):
             self.send_status.text = f"Error: {e}"
 
     # --------------------------------------------------------------- inbox
-    async def refresh_inbox(self, widget, **kwargs):
+    def _render_inbox(self) -> str:
+        if not self.inbox or not self.conv:
+            return ""
+        mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
+        return self.inbox.render(self.conv.rendezvous_d, mine)
+
+    def _kick_refresh(self):
+        """Fire-and-forget background refresh (no-op if there is no running event loop)."""
+        try:
+            asyncio.get_running_loop().create_task(self.refresh_inbox(None, auto=True))
+        except RuntimeError:
+            pass
+
+    async def refresh_inbox(self, widget, auto=False, **kwargs):
         if not self.conv or not self.inbox:
-            self.inbox_status.text = "Start a conversation first"
+            self.inbox_status.text = "Start a conversation first (Setup tab, step 3)"
             return
-        self.inbox_status.text = "Scanning…"
+        if self._refreshing:
+            return
+        self._refreshing = True
+        self.inbox_status.text = "Checking for new messages…" if auto else "Scanning…"
         try:
             frm = int(self.from_in.value) if self.from_in.value.strip() else None
             rpc, conv, inbox, secret = self._rpc(), self.conv, self.inbox, self.secret
             new, noise = await asyncio.to_thread(
                 sync, rpc, conv.rendezvous_d, secret, inbox, frm)
-            self.inbox_out.value = inbox.render()
-            self.inbox_status.text = (f"{new} new message(s). {noise} record(s) on D were not from "
-                                      f"this conversation. Scanned to block {inbox.last_block}.")
+            self.inbox_out.value = self._render_inbox()
+            self._last_auto = time.monotonic()
+            if not inbox.messages:
+                self.inbox_status.text = ("No messages to this D in the last ~7 days (50,000 blocks). "
+                                          "Enter an older block above and tap Refresh to look further back.")
+            else:
+                self.inbox_status.text = (f"{new} new message(s). {noise} record(s) on D were not from "
+                                          f"this conversation. Up to block {inbox.last_block}.")
         except Exception as e:
             self.inbox_status.text = f"Error: {e}"
+        finally:
+            self._refreshing = False
 
     # --------------------------------------------------------------- relay
     async def check_balance(self, widget, **kwargs):

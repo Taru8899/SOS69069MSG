@@ -23,9 +23,14 @@ class Message:
     submitter: str
     text: str
 
-    def line(self) -> str:
-        t = datetime.fromtimestamp(self.timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        return f"[{t}] {self.signer[:8]}…: {self.text}"
+    def line(self, mine=()) -> str:
+        t = datetime.fromtimestamp(self.timestamp, timezone.utc).strftime("%d %b %Y %H:%M UTC")
+        who = "you" if self.signer in mine else short(self.signer)
+        return f"[{t}] from {who} → D\n{self.text}"
+
+
+def short(addr: str) -> str:
+    return f"{addr[:6]}…{addr[-4:]}"
 
 
 def _addr_from_topic(topic: str) -> str:
@@ -92,8 +97,14 @@ class Inbox:
         with open(self.path, "w") as f:
             json.dump({"last_block": last_block, "messages": [asdict(m) for m in self.messages]}, f)
 
-    def render(self) -> str:
-        return "\n".join(m.line() for m in self.messages) or "(no messages yet)"
+    def render(self, d: Optional[str] = None, mine=(), limit: int = 30) -> str:
+        """Latest messages sent to D (intendedTo == D), newest first."""
+        if not self.messages:
+            return "(no messages yet)"
+        shown = self.messages[-limit:][::-1]
+        head = (f"Latest {len(shown)} of {len(self.messages)} message(s) to D "
+                f"{short(d) if d else ''} — newest first\n\n")
+        return head + "\n\n".join(m.line(mine) for m in shown)
 
 
 def sync(rpc: RpcClient, d: str, secret: bytes, inbox: Inbox, from_block: Optional[int] = None,

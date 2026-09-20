@@ -45,6 +45,16 @@ class AddressFactory:
                 return KeyPair.from_private_key(key)
         raise RuntimeError("key derivation failed")
 
+    def my_signer_addresses(self) -> set:
+        """Addresses of every signer this seed has handed out (cached), to label 'you'."""
+        cache = getattr(self, "_addr_cache", None)
+        if cache is None:
+            cache = self._addr_cache = {}
+        for i in range(self.next_index):
+            if i not in cache:
+                cache[i] = self.signer_at(i).address
+        return set(cache.values())
+
     def new_signer(self) -> KeyPair:
         kp = self.signer_at(self.next_index)
         self.next_index += 1
