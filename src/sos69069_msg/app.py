@@ -1,16 +1,16 @@
 """
 SOS69069 MSG — CHECK · SEND · RELAY · SETUP
 
-- Random (or pasted) D is the only common ground
-- Plain 64-char public metadata only (no encryption)
-- Any private key can pay gas on RELAY
-- Short codes on every message
+Style aligned with sos69069.com / cSOS:
+- dark background, green primary buttons
+- massive nav tabs
+- larger bold text, consistent side padding (nothing off-screen)
+- rich message cards
 """
 
 import asyncio
 import json
 import os
-import secrets
 import time
 import traceback
 from pathlib import Path
@@ -36,14 +36,15 @@ DEFAULT_RPC = "https://ethereum-rpc.publicnode.com"
 DEFAULT_MAX_FEE_GWEI = 50.0
 
 BG = "#090E0A"
-FIELD = "#242F27"
+FIELD = "#1A2420"
 PANEL = "#141A16"
 GREEN = "#05AA34"
 GREY = "#2F3B35"
-TAB = "#575757"
-TAB_LINE = "#4FA3D1"
+TAB = "#3A4540"
+TAB_ACTIVE = "#05AA34"
 TXT = "#FFFFFF"
-MUTED = "#C9D1CD"
+MUTED = "#A8B5B0"
+SIDE = 18          # horizontal padding — keeps text on screen
 
 
 def _pack(pad=None, **kw):
@@ -64,33 +65,49 @@ def _row(children, **kw):
     return toga.Box(style=_pack(direction=ROW, background_color=BG, **kw), children=children)
 
 
-def _label(text="", muted=True, size=14, bold=False, pad=(10, 16, 2, 16), **kw):
+def _label(text="", muted=True, size=15, bold=False, pad=(10, SIDE, 4, SIDE), align="center", **kw):
     extra = {"font_weight": "bold"} if bold else {}
-    return toga.Label(text, style=_pack(pad=pad, color=MUTED if muted else TXT,
-                                        background_color=BG, font_size=size, **extra, **kw))
+    try:
+        return toga.Label(
+            text,
+            style=_pack(pad=pad, color=MUTED if muted else TXT, background_color=BG,
+                        font_size=size, text_align=align, **extra, **kw),
+        )
+    except Exception:
+        return toga.Label(
+            text,
+            style=_pack(pad=pad, color=MUTED if muted else TXT, background_color=BG,
+                        font_size=size, **extra, **kw),
+        )
 
 
 def _title(text):
-    return _label(text, muted=False, size=17, bold=True, pad=(18, 16, 4, 16))
+    return _label(text, muted=False, size=20, bold=True, pad=(20, SIDE, 8, SIDE))
 
 
 def _input(value="", placeholder=""):
-    return toga.TextInput(value=value, placeholder=placeholder,
-                          style=_pack(pad=(4, 16, 6, 16), color=TXT, background_color=FIELD,
-                                      font_size=16, height=52))
+    return toga.TextInput(
+        value=value, placeholder=placeholder,
+        style=_pack(pad=(6, SIDE, 8, SIDE), color=TXT, background_color=FIELD,
+                    font_size=16, height=54),
+    )
 
 
-def _panel(height=120, placeholder=""):
-    return toga.MultilineTextInput(readonly=True, value=placeholder,
-                                   style=_pack(pad=(4, 16, 6, 16), color=TXT,
-                                               background_color=PANEL, font_size=14, height=height))
+def _panel(height=160, placeholder=""):
+    return toga.MultilineTextInput(
+        readonly=True, value=placeholder,
+        style=_pack(pad=(8, SIDE, 8, SIDE), color=TXT, background_color=PANEL,
+                    font_size=15, height=height),
+    )
 
 
 def _button(text, handler, primary=True):
     bg = GREEN if primary else GREY
-    return toga.Button(text, on_press=handler,
-                       style=_pack(pad=(8, 16, 8, 16), color=TXT, background_color=bg,
-                                   font_size=16, height=48))
+    return toga.Button(
+        text, on_press=handler,
+        style=_pack(pad=(12, SIDE, 12, SIDE), color=TXT, background_color=bg,
+                    font_size=17, font_weight="bold", height=56),
+    )
 
 
 def _hex(b: bytes) -> str:
@@ -114,10 +131,10 @@ class SOS69069MsgApp(toga.App):
             except Exception:
                 pass
             self.main_window = toga.MainWindow(title="Startup Crash")
-            box = toga.Box(style=_pack(direction=COLUMN, margin=10))
-            box.add(toga.Label("The app crashed during startup. Share this error:"))
+            box = toga.Box(style=_pack(direction=COLUMN, margin=12))
+            box.add(toga.Label("Startup crashed — share this error:"))
             box.add(toga.MultilineTextInput(value=err, readonly=True,
-                                            style=_pack(flex=1, height=400)))
+                                            style=_pack(flex=1, height=420)))
             self.main_window.content = box
             self.main_window.show()
 
@@ -131,20 +148,20 @@ class SOS69069MsgApp(toga.App):
         self._refreshing = False
         self._refresh_started = 0.0
         self.settings = self._load_settings()
-        self._load_seed()          # auto-creates seed if missing
+        self._load_seed()
 
         # ---------- CHECK ----------
         self.d_in = _input(placeholder="D address (0x…)")
-        self.check_status = _label("", muted=False)
-        self.messages_out = _panel(360)
+        self.check_status = _label("", muted=False, size=15, bold=True)
+        self.messages_out = _panel(400)
         self.from_in = _input(placeholder="Scan from block (optional)")
         check = _col([
             _title("CHECK"),
-            _label("Enter any D address and press CHECK. Leave as-is for the current conversation."),
+            _label("Enter any D address and press CHECK.", size=14),
             self.d_in,
             _button("CHECK", self.do_check),
             self.check_status,
-            _label("Messages", muted=False, bold=True, size=16),
+            _label("Messages", muted=False, size=17, bold=True, pad=(16, SIDE, 6, SIDE)),
             self.messages_out,
             _button("Send", self.goto_send, primary=False),
             self.from_in,
@@ -152,39 +169,39 @@ class SOS69069MsgApp(toga.App):
 
         # ---------- SEND ----------
         self.msg_in = _input(placeholder=f"Message (≤{MAX_METADATA_LENGTH} characters)")
-        self.reply_code_in = _input(placeholder="Optional short code to answer (#A3F2)")
-        self.send_status = _label("", muted=False)
-        self.signed_out = _panel(200)
+        self.reply_code_in = _input(placeholder="Optional short code (#A3F2)")
+        self.send_status = _label("", muted=False, size=15, bold=True)
+        self.signed_out = _panel(220)
         send = _col([
             _title("SEND"),
-            _label("Plain public text only. Max 64 characters. No encryption."),
+            _label("Plain public text only. Max 64 characters.", size=14),
             self.msg_in,
-            _label("Optional short code of the message you are answering"),
+            _label("Optional short code of the message you answer", size=14),
             self.reply_code_in,
             _button("Sign", self.sign_message),
             self.send_status,
-            _label("Signed data", muted=False, bold=True),
+            _label("Signed data", muted=False, size=16, bold=True),
             self.signed_out,
             _button("Send → Relay", self.goto_relay),
         ])
 
         # ---------- RELAY ----------
-        self.relayer_in = _input(placeholder="Relayer address OR private key (64 hex)")
+        self.relayer_in = _input(placeholder="Address OR private key (64 hex)")
         self.relayer_note = _label("", size=13)
-        self.balance_label = _label("", muted=False)
+        self.balance_label = _label("", muted=False, size=15, bold=True)
         self.relay_in = toga.MultilineTextInput(
             placeholder="Signed record JSON",
-            style=_pack(pad=(6, 16, 6, 16), color=TXT, background_color=FIELD,
+            style=_pack(pad=(8, SIDE, 8, SIDE), color=TXT, background_color=FIELD,
                         font_size=14, height=200))
-        self.relay_status = _label("", muted=False)
+        self.relay_status = _label("", muted=False, size=15, bold=True)
         relay = _col([
             _title("RELAY"),
-            _label("Paste any private key to pay gas, or leave the default address."),
+            _label("Paste any private key to pay gas, or leave the default.", size=14),
             self.relayer_in,
             self.relayer_note,
             _button("Check balance", self.check_balance, primary=False),
             self.balance_label,
-            _label("Signed record to submit"),
+            _label("Signed record to submit", muted=False, size=15, bold=True),
             self.relay_in,
             _button("Submit to Ethereum", self.submit_record),
             self.relay_status,
@@ -193,18 +210,17 @@ class SOS69069MsgApp(toga.App):
         ])
 
         # ---------- SETUP ----------
-        self.seed_status = _label("", muted=False)
-        self.seed_out = _panel(70, "Seed (auto-created). Back it up if you want.")
+        self.seed_status = _label("", muted=False, size=15, bold=True)
+        self.seed_out = _panel(80, "Seed (auto-created). Back it up if you want.")
         self.seed_in = _input(placeholder="Paste 64-hex seed to import")
-        self.conv_out = _panel(120)
+        self.conv_out = _panel(130)
         self.rpc_in = _input(value=self.settings["rpc_url"])
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
-        self.net_status = _label("", muted=False)
-        self.copy_status = _label("", muted=False)
+        self.net_status = _label("", muted=False, size=15, bold=True)
+        self.copy_status = _label("", muted=False, size=14)
         setup = _col([
             _title("SETUP"),
-            _label("Identity is created automatically so you can sign. You only need to touch this "
-                   "if you want to back up or restore a seed."),
+            _label("Identity is created automatically so you can sign.", size=14),
             self.seed_status,
             self.seed_out,
             _button("Copy seed", self._copier(
@@ -222,18 +238,18 @@ class SOS69069MsgApp(toga.App):
                 primary=False),
             _title("Network"),
             self.rpc_in,
-            _label("Max gas fee (gwei)"),
+            _label("Max gas fee (gwei)", size=14),
             self.cap_in,
             _button("Save network settings", self.save_network, primary=False),
             self.net_status,
         ])
 
-        # Tab order: CHECK · SEND · RELAY · SETUP
         bodies = {"CHECK": check, "SEND": send, "RELAY": relay, "SETUP": setup}
         self.pages = {}
         for name, body in bodies.items():
-            scroller = toga.ScrollContainer(content=body, horizontal=False,
-                                            style=_pack(flex=1, background_color=BG))
+            scroller = toga.ScrollContainer(
+                content=body, horizontal=False,
+                style=_pack(flex=1, background_color=BG))
             self.pages[name] = _col([self._header(name, list(bodies)), scroller], flex=1)
 
         self.main_window = toga.MainWindow(title=self.formal_name)
@@ -241,7 +257,6 @@ class SOS69069MsgApp(toga.App):
         self.main_window.show()
         self._hide_title_bar()
         self._refresh_seed_status()
-        # Auto-start a conversation so D is ready
         if self.mgr and not self.conv:
             self.start_new_conversation(None)
 
@@ -250,16 +265,29 @@ class SOS69069MsgApp(toga.App):
         def make_tab(n):
             def go(widget, **kw):
                 self.main_window.content = self.pages[n]
-            color = TAB_LINE if n == active else TAB
-            return toga.Button(n, on_press=go,
-                               style=_pack(pad=6, color=TXT, background_color=color,
-                                           font_size=14, flex=1, height=40))
+            color = TAB_ACTIVE if n == active else TAB
+            return toga.Button(
+                n, on_press=go,
+                style=_pack(
+                    pad=(14, 4, 14, 4),
+                    color=TXT,
+                    background_color=color,
+                    font_size=16,
+                    font_weight="bold",
+                    flex=1,
+                    height=54,
+                ),
+            )
         try:
-            logo = toga.ImageView(toga.Image(data=logo_bytes()),
-                                  style=_pack(width=36, height=36, pad=(8, 8, 4, 16)))
+            logo = toga.ImageView(
+                toga.Image(data=logo_bytes()),
+                style=_pack(width=40, height=40, pad=(10, 8, 6, SIDE)))
         except Exception:
-            logo = toga.Label("69069", style=_pack(pad=(8, 8, 4, 16), color=GREEN, font_size=16))
-        top = _row([logo, _label(APP_NAME, muted=False, size=16, bold=True, pad=(12, 8, 4, 4))])
+            logo = _label("69069", muted=False, size=18, bold=True, pad=(12, 8, 6, SIDE))
+        top = _row([
+            logo,
+            _label(APP_NAME, muted=False, size=18, bold=True, pad=(14, 8, 6, 4), align="left"),
+        ])
         tabs = _row([make_tab(n) for n in names])
         return _col([top, tabs])
 
@@ -270,7 +298,7 @@ class SOS69069MsgApp(toga.App):
             activity.getSupportActionBar().hide()
         except Exception:
             try:
-                activity.requestWindowFeature(1)  # FEATURE_NO_TITLE
+                activity.requestWindowFeature(1)
             except Exception:
                 pass
 
@@ -340,7 +368,6 @@ class SOS69069MsgApp(toga.App):
         if self.seed_file.exists():
             self._set_seed(_from_hex(self.seed_file.read_text()), save=False)
         else:
-            # Auto-create so the user never has to press "Create identity"
             self._set_seed(generate_seed(), save=True)
 
     def _set_seed(self, seed: bytes, save: bool = True):
@@ -363,7 +390,7 @@ class SOS69069MsgApp(toga.App):
             self.seed_out.value = self.seed_file.read_text()
         if self.relayer:
             self.relayer_in.value = self.relayer.address
-            self.relayer_note.text = "Default relayer (seed-derived). Paste any private key to override."
+            self.relayer_note.text = "Default relayer. Paste any private key to override."
 
     def import_seed(self, widget, **kwargs):
         try:
@@ -379,7 +406,7 @@ class SOS69069MsgApp(toga.App):
         try:
             if not self.mgr:
                 raise ValueError("Identity missing")
-            self.conv = self.mgr.start_conversation()          # brand-new random D
+            self.conv = self.mgr.start_conversation()
             self.inbox = Inbox(str(self.data_dir / f"inbox_{self.conv.rendezvous_d[2:10]}.json"))
             self.d_in.value = self.conv.rendezvous_d
             self.messages_out.value = self.inbox.render(self.conv.rendezvous_d)
@@ -400,7 +427,6 @@ class SOS69069MsgApp(toga.App):
         if not d:
             self.check_status.text = "Enter a D address first"
             return
-        # Switch conversation context to the typed D if different
         try:
             if not self.mgr:
                 raise ValueError("Identity missing")
@@ -428,7 +454,7 @@ class SOS69069MsgApp(toga.App):
             mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
             self.messages_out.value = inbox.render(d, mine)
             self.check_status.text = (
-                f"{new} new message(s). Scanned to block {inbox.last_block}."
+                f"{new} new · block {inbox.last_block}"
                 if inbox.last_block is not None else "Done."
             )
         except Exception as e:
@@ -440,7 +466,7 @@ class SOS69069MsgApp(toga.App):
     def sign_message(self, widget, **kwargs):
         try:
             if not self.conv:
-                raise ValueError("Start a conversation first (SETUP → Start new conversation)")
+                raise ValueError("Start a conversation first (SETUP)")
             text = (self.msg_in.value or "").strip()
             if not text:
                 raise ValueError("Type a message first")
@@ -466,17 +492,14 @@ class SOS69069MsgApp(toga.App):
                     self.conv.rendezvous_d,
                     self.mgr.factory.my_signer_addresses())
             code = short_code(_hex(ph))
-            self.send_status.text = (
-                f"Signed ✔  #{code}  (not on chain yet — open RELAY and Submit)"
-            )
+            self.send_status.text = f"Signed ✔  #{code}  — open RELAY and Submit"
             self.msg_in.value = ""
             self.reply_code_in.value = ""
         except Exception as e:
             self.send_status.text = f"Error: {e}"
 
-    # ------------------------------------------------------------------ RELAY helpers
+    # ------------------------------------------------------------------ RELAY
     def _active_relayer(self) -> KeyPair:
-        """Prefer a pasted private key; otherwise the seed-derived relayer."""
         raw = (self.relayer_in.value or "").strip().removeprefix("0x")
         if len(raw) == 64:
             try:
@@ -505,7 +528,6 @@ class SOS69069MsgApp(toga.App):
             tx = await asyncio.to_thread(submit, rpc, relayer, rec, cap)
             self.last_tx_link = f"https://etherscan.io/tx/{tx}"
             self.relay_status.text = f"Sent ✔\n{self.last_tx_link}"
-            # Mark pending as submitted
             ph = rec.get("payloadHash", "")
             if self.inbox and ph:
                 self.inbox.mark_submitted(ph, tx)

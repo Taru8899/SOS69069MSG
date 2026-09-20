@@ -1,7 +1,7 @@
 """Read EVERYTHING sent to address D from SignatureRecorded logs.
 
-All metadata is treated as plain public text.
-Each message is shown with a short code (#XXXX = first 4 hex of payloadHash).
+All metadata is plain public text.
+Each message is shown in a dense card style (body, signer, tx, block, time, short code).
 Pending (signed but not yet submitted) messages appear at the top.
 """
 
@@ -26,6 +26,8 @@ _RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "m
 
 
 def short(addr: str) -> str:
+    if not addr or len(addr) < 10:
+        return addr or "?"
     return f"{addr[:6]}…{addr[-4:]}"
 
 
@@ -41,10 +43,20 @@ class Message:
     payload_hash: str = ""
 
     def line(self, mine=()) -> str:
-        t = datetime.fromtimestamp(self.timestamp, timezone.utc).strftime("%d %b %Y %H:%M UTC")
-        who = "you" if self.signer in mine else short(self.signer)
+        """Dense card matching sos69069.com information density."""
+        t = datetime.fromtimestamp(self.timestamp, timezone.utc)
+        when = t.strftime("%d/%m/%Y, %H:%M:%S")
+        who = "you" if self.signer in mine else self.signer
         code = short_code(self.payload_hash) if self.payload_hash else "----"
-        return f"#{code}  [{t}] from {who}\n{self.text}"
+        tx = self.tx_hash if self.tx_hash.startswith("0x") else ("0x" + self.tx_hash)
+        return (
+            f"{self.text}\n"
+            f"{who}\n"
+            f"tx{tx}\n"
+            f"· block {self.block} · {when}\n"
+            f"TRUST Received ·  #{code}\n"
+            f"REPLY (start conv {code.lower()})"
+        )
 
 
 def _addr_from_topic(topic: str) -> str:
@@ -187,12 +199,20 @@ class Inbox:
         lines = []
         for o in reversed(self.pending()):
             code = short_code(o["ph"])
-            lines.append(f"#{code}  ⏳ NOT submitted yet\n{o['text']}")
+            lines.append(
+                f"{o['text']}\n"
+                f"⏳ NOT submitted yet\n"
+                f"#{code}\n"
+                f"REPLY (start conv {code.lower()})"
+            )
         for m in reversed(self.messages):
             lines.append(m.line(mine))
         if not lines:
-            return f"No messages to {d or 'D'} yet.\nSign on SEND, then submit on RELAY."
-        return "\n\n".join(lines)
+            return (
+                f"No messages to {d or 'D'} yet.\n\n"
+                f"Sign on SEND, then submit on RELAY."
+            )
+        return "\n\n────────────────────\n\n".join(lines)
 
 
 def sync(rpc: RpcClient, d: str, inbox: Inbox, from_block: Optional[int] = None,
