@@ -28,3 +28,4 @@ requires = ["toga-winforms"]
 
 [tool.briefcase.app.sos69069-msg.android]
 requires = ["toga-android"]
+splash_background_color = "#03A934"   # startup screen matches the logo green
