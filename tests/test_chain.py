@@ -171,24 +171,75 @@ class TestRelayer(unittest.TestCase):
                 "data": "0x" + data.hex(),
                 "topics": ["0x" + SIGNATURE_RECORDED_TOPIC.hex(), t(signer), t(d), t(submitter)]}
 
-    def test_sync_decrypts_ours_ignores_noise_and_is_incremental(self):
+    def test_sync_shows_everything_sent_to_d_and_is_incremental(self):
         rpc = FakeRpc()
         d = self.conv.rendezvous_d
+        other = prepare_and_sign(self.key, d, "from another secret", secrets.token_bytes(32))
         rpc.logs = [
             self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
-            self._log(991, 0, self.key.address, d, b"\x01" * 32, self.sig, 1700000001, "not-encrypted-spam"),
+            self._log(991, 0, self.key.address, d, b"\x01" * 32, self.sig, 1700000001, "plain hello"),
+            self._log(992, 0, self.key.address, d, other[0], other[2], 1700000002, other[1]),
         ]
         inbox = Inbox(os.path.join(self.tmp, "inbox.json"))
-        new, noise = sync(rpc, d, self.secret, inbox)
-        self.assertEqual((new, noise), (1, 1))
-        self.assertIn("hi there", inbox.render())
+        new, unreadable = sync(rpc, d, self.secret, inbox)
+        self.assertEqual((new, unreadable), (3, 1))
+        out = inbox.render(d)
+        self.assertIn("hi there", out)                       # decrypted
+        self.assertIn("plain hello", out)                    # unencrypted message is NOT dropped
+        self.assertIn("(unencrypted)", out)
+        self.assertIn("🔒 encrypted", out)                    # other-secret record shown, unreadable
         self.assertEqual(inbox.last_block, 1000)
-        # topic filter targets D; second sync only fetches new blocks
         self.assertEqual(rpc.log_calls[0]["topics"][2], "0x" + parse_address(d).rjust(32, b"\0").hex())
         rpc.head = 1010; rpc.log_calls.clear()
         new, _ = sync(rpc, d, self.secret, Inbox(os.path.join(self.tmp, "inbox.json")))
-        self.assertEqual(new, 0)
-        self.assertEqual(int(rpc.log_calls[0]["fromBlock"], 16), 1001)
+        self.assertEqual(new, 0)                             # overlap re-scan is de-duplicated
+        self.assertEqual(int(rpc.log_calls[0]["fromBlock"], 16), 1001 - 20)
+
+    def test_lagging_rpc_cannot_hide_recent_message_forever(self):
+        rpc = FakeRpc(); d = self.conv.rendezvous_d
+        inbox = Inbox(os.path.join(self.tmp, "lag.json"))
+        sync(rpc, d, self.secret, inbox)                     # RPC did not know block 998 yet
+        rpc.logs = [self._log(998, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
+        rpc.head = 1005
+        new, _ = sync(rpc, d, self.secret, inbox)
+        self.assertEqual(new, 1)
+
+    def test_pending_until_on_chain(self):
+        rpc = FakeRpc(); d = self.conv.rendezvous_d
+        inbox = Inbox(os.path.join(self.tmp, "pend.json"))
+        inbox.add_pending("0x" + self.ph.hex(), "hi there")
+        self.assertIn("NOT submitted yet", inbox.render(d))
+        inbox.mark_submitted("0x" + self.ph.hex(), "0xabc")
+        self.assertIn("waiting to be mined", inbox.render(d))
+        rpc.logs = [self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
+        sync(rpc, d, self.secret, inbox)
+        self.assertEqual(inbox.pending(), [])                # now confirmed on chain
+        self.assertNotIn("⏳", inbox.render(d))
+        self.assertEqual(Inbox(inbox.path).pending(), [])   # persisted
+
+    def test_range_limited_rpc_is_handled_but_other_errors_are_not(self):
+        from sos69069_msg.reader import scan
+        d = self.conv.rendezvous_d
+        rpc = FakeRpc()
+        rpc.logs = [self._log(50, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
+                    self._log(9500, 0, self.key.address, d, b"\x02" * 32, self.sig, 1700000001, "late")]
+        orig = rpc.get_logs
+        def limited(flt):
+            if int(flt["toBlock"], 16) - int(flt["fromBlock"], 16) > 3000:
+                raise RpcError("eth_getLogs: query exceeds max block range 2000")
+            return orig(flt)
+        rpc.get_logs = limited
+        msgs, _ = scan(rpc, d, self.secret, 0, 10000)
+        self.assertEqual(len(msgs), 2)                       # halved until the provider accepted it
+        def broken(flt): raise RpcError("eth_getLogs: HTTP Error 403: Forbidden")
+        rpc.get_logs = broken
+        with self.assertRaises(RpcError): scan(rpc, d, self.secret, 0, 10000)
+
+    def test_old_cache_format_is_rescanned(self):
+        path = os.path.join(self.tmp, "old.json")
+        with open(path, "w") as f:
+            json.dump({"last_block": 999, "messages": []}, f)   # v1 cache had dropped messages
+        self.assertIsNone(Inbox(path).last_block)
 
     def test_inbox_render_newest_first_and_labels_you(self):
         rpc = FakeRpc(); d = self.conv.rendezvous_d
