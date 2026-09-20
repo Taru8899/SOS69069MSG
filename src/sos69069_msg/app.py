@@ -131,6 +131,7 @@ class SOS69069MsgApp(toga.App):
         self.mgr = self.conv = self.secret = self.inbox = self.relayer = None
         self.last_tx_link = ""
         self._refreshing = False
+        self._refresh_started = 0.0
         self._last_auto = 0.0
         self.settings = self._load_settings()
         self._load_seed()
@@ -162,7 +163,9 @@ class SOS69069MsgApp(toga.App):
             self.seed_in,
             _button("Import seed", self.import_seed, primary=False),
             _title("2. Shared secret"),
-            _label("Exchange it out-of-band (in person, Signal…). Both people use the same one."),
+            _label("Share this secret with the person you want to chat with (in person or a private "
+                   "channel). You both enter the SAME secret. Anyone who has it can read and write "
+                   "to the chat, so use a new one per conversation."),
             self.secret_in,
             _button("Generate new secret", self.gen_secret, primary=False),
             _button("Copy secret", self._copier(lambda: self.secret_in.value, "secret", self.copy_status),
@@ -252,6 +255,7 @@ class SOS69069MsgApp(toga.App):
         self.main_window = toga.MainWindow(title=self.formal_name)
         self.main_window.content = self.pages["Setup"]
         self.main_window.show()
+        self._hide_title_bar()
         self._refresh_seed_status()
 
     # ------------------------------------------------------------ clipboard
@@ -286,6 +290,18 @@ class SOS69069MsgApp(toga.App):
                 status.text = "Copy failed. Long-press the text to select it instead."
         return handler
 
+    def _hide_title_bar(self):
+        """Remove Android's title bar (the app-name block above the logo + tabs)."""
+        try:
+            activity = self._impl.native
+            for getter in ("getSupportActionBar", "getActionBar"):
+                bar = getattr(activity, getter)()
+                if bar is not None:
+                    bar.hide()
+                    return
+        except Exception:
+            pass
+
     def _header(self, current: str, names):
         try:
             logo = toga.ImageView(toga.Image(data=logo_bytes()),
@@ -307,6 +323,7 @@ class SOS69069MsgApp(toga.App):
     def _go(self, name):
         async def handler(widget, **kwargs):
             self.main_window.content = self.pages[name]
+            self._hide_title_bar()
             if name == "Inbox" and self.conv and time.monotonic() - self._last_auto > 15:
                 await self.refresh_inbox(None, auto=True)   # latest messages to D, automatically
         return handler
@@ -457,7 +474,11 @@ class SOS69069MsgApp(toga.App):
             }, indent=2)
             self.send_out.value = record
             self.relay_in.value = record          # ready to submit on the Relay page
-            self.send_status.text = f"Signed ✔ (one-time signer {key.address[:10]}…)"
+            if self.inbox:
+                self.inbox.add_pending(_hex(ph), self.msg_in.value)
+                self.inbox_out.value = self._render_inbox()
+            self.send_status.text = (f"Signed ✔ (one-time signer {key.address[:10]}…). NOT on chain yet: "
+                                     "open Relay and tap Submit (the relayer needs a little ETH).")
             self.msg_in.value = ""
         except Exception as e:
             self.send_status.text = f"Error: {e}"
@@ -476,27 +497,46 @@ class SOS69069MsgApp(toga.App):
         except RuntimeError:
             pass
 
+    def _set_inbox_status(self, text: str):
+        self.inbox_status.text = text
+
     async def refresh_inbox(self, widget, auto=False, **kwargs):
         if not self.conv or not self.inbox:
             self.inbox_status.text = "Start a conversation first (Setup tab, step 3)"
             return
-        if self._refreshing:
+        if self._refreshing and time.monotonic() - self._refresh_started < 90:
+            self.inbox_status.text = "Already scanning… please wait a moment."
             return
-        self._refreshing = True
-        self.inbox_status.text = "Checking for new messages…" if auto else "Scanning…"
+        self._refreshing, self._refresh_started = True, time.monotonic()
+        self.inbox_status.text = "Checking for new messages…" if auto else "Scanning the chain…"
+        loop = asyncio.get_running_loop()
+
+        def progress(msg):  # called from the worker thread
+            loop.call_soon_threadsafe(self._set_inbox_status, msg)
+
         try:
             frm = int(self.from_in.value) if self.from_in.value.strip() else None
             rpc, conv, inbox, secret = self._rpc(), self.conv, self.inbox, self.secret
-            new, noise = await asyncio.to_thread(
-                sync, rpc, conv.rendezvous_d, secret, inbox, frm)
+            new, unreadable = await asyncio.to_thread(
+                sync, rpc, conv.rendezvous_d, secret, inbox, frm, progress=progress)
             self.inbox_out.value = self._render_inbox()
             self._last_auto = time.monotonic()
-            if not inbox.messages:
-                self.inbox_status.text = ("No messages to this D in the last ~7 days (50,000 blocks). "
-                                          "Enter an older block above and tap Refresh to look further back.")
+            n = len(inbox.messages)
+            where = f"blocks {inbox.last_scan_from:,}–{inbox.last_block:,}"
+            if n == 0:
+                msg = f"No records to this D on chain yet ({where})."
+                pend = len(inbox.pending())
+                if pend:
+                    msg += (f" You have {pend} signed message(s) that are not on chain: "
+                            "submit them on the Relay tab (the relayer needs a little ETH).")
+                else:
+                    msg += (" Either nothing was submitted to this D, or the other person "
+                            "used a different shared secret (then their D differs).")
             else:
-                self.inbox_status.text = (f"{new} new message(s). {noise} record(s) on D were not from "
-                                          f"this conversation. Up to block {inbox.last_block}.")
+                msg = (f"{n} message(s) to D on chain ({new} new"
+                       f"{f', {unreadable} encrypted with another secret' if unreadable else ''}). "
+                       f"Scanned {where}.")
+            self.inbox_status.text = msg
         except Exception as e:
             self.inbox_status.text = f"Error: {e}"
         finally:
@@ -523,7 +563,11 @@ class SOS69069MsgApp(toga.App):
             rpc, relayer, cap = self._rpc(), self.relayer, float(self.settings["max_fee_gwei"])
             tx = await asyncio.to_thread(submit, rpc, relayer, rec, cap)
             self.last_tx_link = f"https://etherscan.io/tx/{tx}"
-            self.relay_status.text = f"Sent ✔\n{self.last_tx_link}"
+            if self.inbox:
+                self.inbox.mark_submitted(_hex(rec["payload_hash"]), tx)
+                self.inbox_out.value = self._render_inbox()
+            self.relay_status.text = (f"Sent ✔ Mining takes ~15–60 s, then open Inbox → Refresh.\n"
+                                      f"{self.last_tx_link}")
         except Exception as e:
             self.relay_status.text = f"Error: {e}"
 
