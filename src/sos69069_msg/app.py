@@ -85,8 +85,9 @@ def _button(text, on_press, primary=True):
                                    background_color=GREEN if primary else GREY, height=52))
 
 
-def _panel(height, placeholder=""):
-    return toga.MultilineTextInput(readonly=True, placeholder=placeholder,
+def _panel(height, placeholder="", readonly=False):
+    # readonly=False on purpose: Android does not allow selecting/copying text in read-only boxes
+    return toga.MultilineTextInput(readonly=readonly, placeholder=placeholder,
                                    style=_pack(pad=(6, 16, 6, 16), color=TXT, background_color=PANEL,
                                                font_size=14, height=height))
 
@@ -127,6 +128,7 @@ class SOS69069MsgApp(toga.App):
         self.seed_file = self.data_dir / "seed.hex"
         self.settings_file = self.data_dir / "settings.json"
         self.mgr = self.conv = self.secret = self.inbox = self.relayer = None
+        self.last_tx_link = ""
         self.settings = self._load_settings()
         self._load_seed()
 
@@ -139,21 +141,30 @@ class SOS69069MsgApp(toga.App):
         self.rpc_in = _input(value=self.settings["rpc_url"])
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
         self.net_status = _label("", muted=False)
+        self.copy_status = _label("", muted=False)
 
         setup = _col([
             _title("1. Identity"),
             self.seed_status,
             _button("Create new identity", self.create_identity),
             self.seed_out,
+            _button("Copy seed", self._copier(lambda: self.seed_out.value or (
+                self.seed_file.read_text() if self.seed_file.exists() else ""), "seed", self.copy_status),
+                primary=False),
+            self.copy_status,
             self.seed_in,
             _button("Import seed", self.import_seed, primary=False),
             _title("2. Shared secret"),
             _label("Exchange it out-of-band (in person, Signal…). Both people use the same one."),
             self.secret_in,
             _button("Generate new secret", self.gen_secret, primary=False),
+            _button("Copy secret", self._copier(lambda: self.secret_in.value, "secret", self.copy_status),
+                    primary=False),
             _title("3. Conversation"),
             _button("Start conversation", self.start_conversation),
             self.conv_out,
+            _button("Copy D address", self._copier(lambda: self.conv.rendezvous_d, "D address",
+                                                   self.copy_status), primary=False),
             _title("4. Network (Ethereum mainnet)"),
             _label("RPC URL (https). The provider sees your IP and queries."),
             self.rpc_in,
@@ -178,6 +189,8 @@ class SOS69069MsgApp(toga.App):
             _label("Signed record. Share it with anyone who can submit it, or submit it "
                    "yourself on the Relay page:"),
             self.send_out,
+            _button("Copy signed record", self._copier(lambda: self.send_out.value, "signed record",
+                                                       self.send_status)),
         ])
 
         # ---------------- Inbox ----------------
@@ -189,10 +202,12 @@ class SOS69069MsgApp(toga.App):
             self.from_in,
             self.inbox_status,
             self.inbox_out,
+            _button("Copy messages", self._copier(lambda: self.inbox_out.value, "messages",
+                                                  self.inbox_status), primary=False),
         ])
 
         # ---------------- Relay ----------------
-        self.relayer_label = _label("", muted=False, size=13)
+        self.relayer_in = _input()
         self.balance_label = _label("", muted=False)
         self.relay_in = toga.MultilineTextInput(
             placeholder="Paste a signed record JSON here",
@@ -200,13 +215,18 @@ class SOS69069MsgApp(toga.App):
         self.relay_status = _label("", muted=False)
         relay = _col([
             _label("Your relayer address. Send it a little ETH; it pays gas:"),
-            self.relayer_label,
+            self.relayer_in,
+            _button("Copy relayer address", self._copier(lambda: self.relayer_in.value,
+                                                         "relayer address", self.balance_label),
+                    primary=False),
             _button("Check balance", self.check_balance, primary=False),
             self.balance_label,
             _label("Record to submit (yours, or a stranger's):"),
             self.relay_in,
             _button("Submit to Ethereum", self.submit_record),
             self.relay_status,
+            _button("Copy tx link", self._copier(lambda: self.last_tx_link, "tx link", self.relay_status),
+                    primary=False),
         ])
 
         # Pinned header (logo + title, tabs under it) above a scrolling body. Each page is its
@@ -221,6 +241,38 @@ class SOS69069MsgApp(toga.App):
         self.main_window.content = self.pages["Setup"]
         self.main_window.show()
         self._refresh_seed_status()
+
+    # ------------------------------------------------------------ clipboard
+    def _copy(self, text: str) -> bool:
+        """Copy to the system clipboard. Toga's clipboard first, native Android as fallback."""
+        try:
+            self.clipboard.set_text(text)
+            return True
+        except Exception:
+            pass
+        try:
+            from java import jclass  # Chaquopy (Android only)
+            Context = jclass("android.content.Context")
+            ClipData = jclass("android.content.ClipData")
+            cm = self._impl.native.getSystemService(Context.CLIPBOARD_SERVICE)
+            cm.setPrimaryClip(ClipData.newPlainText("sos69069", text))
+            return True
+        except Exception:
+            return False
+
+    def _copier(self, getter, what: str, status):
+        def handler(widget, **kwargs):
+            try:
+                text = getter() or ""
+            except Exception:
+                text = ""
+            if not text.strip():
+                status.text = f"Nothing to copy yet ({what})"
+            elif self._copy(text):
+                status.text = f"Copied {what} ✔"
+            else:
+                status.text = "Copy failed. Long-press the text to select it instead."
+        return handler
 
     def _header(self, current: str, names):
         try:
@@ -291,7 +343,7 @@ class SOS69069MsgApp(toga.App):
 
     def _refresh_seed_status(self):
         self.seed_status.text = "Identity loaded ✔" if self.mgr else "No identity yet"
-        self.relayer_label.text = self.relayer.address if self.relayer else "(create an identity first)"
+        self.relayer_in.value = self.relayer.address if self.relayer else ""
 
     def create_identity(self, widget, **kwargs):
         seed = generate_seed()
@@ -393,7 +445,8 @@ class SOS69069MsgApp(toga.App):
             self.relay_status.text = "Submitting…"
             rpc, relayer, cap = self._rpc(), self.relayer, float(self.settings["max_fee_gwei"])
             tx = await asyncio.to_thread(submit, rpc, relayer, rec, cap)
-            self.relay_status.text = f"Sent ✔\nhttps://etherscan.io/tx/{tx}"
+            self.last_tx_link = f"https://etherscan.io/tx/{tx}"
+            self.relay_status.text = f"Sent ✔\n{self.last_tx_link}"
         except Exception as e:
             self.relay_status.text = f"Error: {e}"
 
