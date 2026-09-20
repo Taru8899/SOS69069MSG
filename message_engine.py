@@ -1,40 +1,45 @@
 """
-Turns a human message into a ≤64-char metadata field + payloadHash
-and produces a ready-to-submit signed Record.
+Turns a human message into (payloadHash, metadata, signature), and back.
 """
 
 from typing import Tuple
-from eth_account import Account
-from crypto_utils import random_payload_hash, encrypt_message, derive_material
+
+from crypto_utils import (
+    derive_material, open_message, random_payload_hash, seal_message,
+)
 from eip712 import sign_record
 from config import MAX_METADATA_LENGTH
 
 
+def _msg_key(shared_secret: bytes) -> bytes:
+    return derive_material(shared_secret, b"sos69069/msg-key", 32)
+
+
 def prepare_and_sign(
-    account: Account,
+    account,
     signer_address: str,
     intended_to: str,          # D
     plaintext: str,
     shared_secret: bytes,
     use_encryption: bool = True,
 ) -> Tuple[bytes, str, bytes]:
-    """
-    Returns (payload_hash, metadata, signature)
-    metadata is the actual message carrier (≤ 64 chars).
-    """
-    if use_encryption:
-        key = derive_material(shared_secret, b"msg-key", 32)
-        ct = encrypt_message(plaintext.encode("utf-8"), key)
-        # For demo we store a short hex representation.
-        # In production you would use a more compact encoding
-        # or split long messages across multiple records.
-        metadata = ct.hex()[:MAX_METADATA_LENGTH]
-    else:
-        metadata = plaintext[:MAX_METADATA_LENGTH]
-
-    if len(metadata.encode("utf-8")) > MAX_METADATA_LENGTH:
-        raise ValueError("Message does not fit into 64-character metadata field")
-
+    """Returns (payload_hash, metadata, signature). Raises if the message
+    does not fit — it is never silently truncated."""
     payload_hash = random_payload_hash()
+    data = plaintext.encode("utf-8")
+
+    if use_encryption:
+        metadata = seal_message(data, _msg_key(shared_secret), payload_hash)
+    else:
+        if len(data) > MAX_METADATA_LENGTH:
+            raise ValueError(f"Plain message limited to {MAX_METADATA_LENGTH} bytes (got {len(data)})")
+        metadata = plaintext
+
     signature = sign_record(account, signer_address, intended_to, payload_hash, metadata)
     return payload_hash, metadata, signature
+
+
+def read_record(metadata: str, payload_hash: bytes, shared_secret: bytes) -> str:
+    """Decrypt a record read from a SignatureRecorded event on D.
+    Raises InvalidTag for records that were not made with this secret."""
+    return open_message(metadata, _msg_key(shared_secret), payload_hash).decode("utf-8")

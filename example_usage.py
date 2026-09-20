@@ -1,63 +1,53 @@
 """
-Minimal end-to-end example:
+End-to-end example:
 1. Two users share a secret
-2. Both derive the same D
-3. Each signs a short message into the 64-char metadata field
-4. The signed records are ready for a random relayer / credit holder to submit
+2. Both independently derive the SAME rendezvous address D
+3. Each signs a short encrypted message into the 64-char metadata field
+4. Signatures are verified locally, then the other side decrypts the record
 """
 
-from eth_account import Account
+import secrets
+import tempfile
+import os
+
 from address_factory import AddressFactory
 from conversation import ConversationManager
-from message_engine import prepare_and_sign
+from eip712 import verify_record
+from message_engine import prepare_and_sign, read_record
 from submission import build_record_signature_call
-import secrets
+
+MNEMONIC_A = "test test test test test test test test test test test junk"
+MNEMONIC_B = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
 
 
 def main():
-    # --- User A ---
-    mnemonic_a = "test test test test test test test test test test test junk"
-    factory_a = AddressFactory(mnemonic_a, "used_a.json")
-    mgr_a = ConversationManager(factory_a)
+    tmp = tempfile.mkdtemp()
+    mgr_a = ConversationManager(AddressFactory(MNEMONIC_A, os.path.join(tmp, "a.json")))
+    mgr_b = ConversationManager(AddressFactory(MNEMONIC_B, os.path.join(tmp, "b.json")))
 
-    # --- User B ---
-    mnemonic_b = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
-    factory_b = AddressFactory(mnemonic_b, "used_b.json")
-    mgr_b = ConversationManager(factory_b)
+    shared_secret = secrets.token_bytes(32)  # in real life exchanged via Signal / in person
 
-    # Shared secret (in real life comes from Signal / Tor / etc.)
-    shared_secret = secrets.token_bytes(32)
-
-    # Both start the conversation → independently obtain the same D
-    conv_a = mgr_a.start_conversation(shared_secret, my_index_base=0)
-    conv_b = mgr_b.start_conversation(shared_secret, my_index_base=0)
-
-    assert conv_a.rendezvous_d == conv_b.rendezvous_d
+    conv_a = mgr_a.start_conversation(shared_secret)
+    conv_b = mgr_b.start_conversation(shared_secret)
+    assert conv_a.rendezvous_d == conv_b.rendezvous_d, "A and B must derive the same D"
     D = conv_a.rendezvous_d
     print(f"Rendezvous D = {D}")
 
-    # User A signs a message
-    signer_a = conv_a.my_signers[0]
-    acct_a = Account.from_mnemonic(mnemonic_a, account_path="m/44'/60'/2'/0/0")
-    payload_hash_a, metadata_a, sig_a = prepare_and_sign(
-        acct_a, signer_a, D, "Hello from A", shared_secret
-    )
-    call_a = build_record_signature_call(signer_a, D, payload_hash_a, sig_a, metadata_a)
-    print("\nUser A ready-to-submit call:")
-    print(call_a)
+    # A -> D
+    signer_a, acct_a = mgr_a.next_signer(conv_a)
+    ph, meta, sig = prepare_and_sign(acct_a, signer_a, D, "Hello from A", shared_secret)
+    assert verify_record(signer_a, D, ph, meta, sig)
+    print("\nA's call (hand to any relayer):")
+    print(build_record_signature_call(signer_a, D, ph, sig, meta))
 
-    # User B signs a message
-    signer_b = conv_b.my_signers[0]
-    acct_b = Account.from_mnemonic(mnemonic_b, account_path="m/44'/60'/2'/0/0")
-    payload_hash_b, metadata_b, sig_b = prepare_and_sign(
-        acct_b, signer_b, D, "Hello from B", shared_secret
-    )
-    call_b = build_record_signature_call(signer_b, D, payload_hash_b, sig_b, metadata_b)
-    print("\nUser B ready-to-submit call:")
-    print(call_b)
+    # B reads it from the chain event (metadata + payloadHash) and decrypts
+    print("\nB decrypts:", read_record(meta, ph, shared_secret))
 
-    print("\nAny unrelated user (or community relayer) can now broadcast these calls.")
-    print("The 64-character metadata field carries the actual messages.")
+    # B -> D
+    signer_b, acct_b = mgr_b.next_signer(conv_b)
+    ph2, meta2, sig2 = prepare_and_sign(acct_b, signer_b, D, "Hello from B", shared_secret)
+    assert verify_record(signer_b, D, ph2, meta2, sig2)
+    print("A decrypts:", read_record(meta2, ph2, shared_secret))
 
 
 if __name__ == "__main__":

@@ -18,10 +18,12 @@ from eth_utils import to_hex
 
 from address_factory import AddressFactory
 from conversation import ConversationManager
-from message_engine import prepare_and_sign
+from message_engine import prepare_and_sign, read_record
+from eip712 import verify_record
 from submission import build_record_signature_call
 from gas_credits import GasCreditBook
-from config import CONTRACT_ADDRESS, MAX_METADATA_LENGTH
+from config import CONTRACT_ADDRESS, MAX_METADATA_LENGTH, CHAIN_ID
+from crypto_utils import MAX_PLAINTEXT_BYTES
 
 # In-memory session state (for demo only)
 state = {
@@ -35,11 +37,7 @@ state = {
 
 
 def generate_mnemonic():
-    Account.enable_unaudited_hdwallet_features()
-    mnemonic = Account.create().key.hex()  # placeholder – better use proper BIP39
-    # Simple demo mnemonic generator
-    from eth_account.hdaccount import generate_mnemonic
-    mnemonic = generate_mnemonic(12)
+    _, mnemonic = Account.create_with_mnemonic()
     state["mnemonic"] = mnemonic
     state["factory"] = AddressFactory(mnemonic, "ui_used.json")
     state["mgr"] = ConversationManager(state["factory"])
@@ -86,31 +84,23 @@ def start_conversation():
 
 
 def sign_message(message: str, use_encryption: bool):
-    if not state.get("conv") or not state.get("mnemonic"):
+    if not state.get("conv") or not state.get("mgr"):
         return "Start a conversation first", "", ""
-    if len(message.encode("utf-8")) > MAX_METADATA_LENGTH and not use_encryption:
-        return f"Message too long for plain metadata (max {MAX_METADATA_LENGTH} chars)", "", ""
 
     conv = state["conv"]
-    signer = conv.my_signers[0]
-    # Derive the account for the first signer (index 0)
-    acct = Account.from_mnemonic(state["mnemonic"], account_path="m/44'/60'/2'/0/0")
-
     try:
+        signer, acct = state["mgr"].next_signer(conv)  # fresh one-time signer
         payload_hash, metadata, signature = prepare_and_sign(
-            acct,
-            signer,
-            conv.rendezvous_d,
-            message,
-            state["shared_secret"],
-            use_encryption=use_encryption,
+            acct, signer, conv.rendezvous_d, message,
+            state["shared_secret"], use_encryption=use_encryption,
         )
-        call = build_record_signature_call(
-            signer, conv.rendezvous_d, payload_hash, signature, metadata
-        )
+        if not verify_record(signer, conv.rendezvous_d, payload_hash, metadata, signature):
+            return "Local signature check failed", "", ""
+        call = build_record_signature_call(signer, conv.rendezvous_d, payload_hash, signature, metadata)
         call_json = json.dumps(
             {
                 "to": call["to"],
+                "chainId": CHAIN_ID,
                 "function": call["function"],
                 "signer": call["args"][0],
                 "intendedTo": call["args"][1],
@@ -120,13 +110,19 @@ def sign_message(message: str, use_encryption: bool):
             },
             indent=2,
         )
-        return (
-            f"Signed successfully\nMetadata (message carrier): {metadata}",
-            to_hex(payload_hash),
-            call_json,
-        )
+        return f"Signed with one-time signer {signer}\nMetadata: {metadata}", to_hex(payload_hash), call_json
     except Exception as e:
         return f"Error: {e}", "", ""
+
+
+def decrypt_record(metadata: str, payload_hash_hex: str):
+    if not state.get("shared_secret"):
+        return "Set the shared secret first"
+    try:
+        ph = bytes.fromhex(payload_hash_hex.strip().replace("0x", ""))
+        return read_record(metadata.strip(), ph, state["shared_secret"])
+    except Exception as e:
+        return f"Could not decrypt (wrong secret, or not a message for this conversation): {type(e).__name__}"
 
 
 def earn_credit():
@@ -182,7 +178,7 @@ with gr.Blocks(title="SOS 69069 Privacy Messenger", theme=gr.themes.Soft()) as d
 
     with gr.Tab("4. Sign Message"):
         msg_in = gr.Textbox(
-            label=f"Message (will be packed into ≤{MAX_METADATA_LENGTH} char metadata)",
+            label=f"Message (≤{MAX_PLAINTEXT_BYTES} bytes encrypted, ≤{MAX_METADATA_LENGTH} bytes plain)",
             lines=2,
             max_lines=3,
         )
@@ -198,7 +194,15 @@ with gr.Blocks(title="SOS 69069 Privacy Messenger", theme=gr.themes.Soft()) as d
             outputs=[sign_status, payload_out, call_out],
         )
 
-    with gr.Tab("5. Gas Credits"):
+    with gr.Tab("5. Read a record"):
+        gr.Markdown("Paste `metadata` and `payloadHash` from a `SignatureRecorded` event on your D.")
+        meta_in = gr.Textbox(label="metadata")
+        ph_in = gr.Textbox(label="payloadHash (0x…)")
+        btn_dec = gr.Button("Decrypt")
+        dec_out = gr.Textbox(label="Message")
+        btn_dec.click(decrypt_record, inputs=[meta_in, ph_in], outputs=dec_out)
+
+    with gr.Tab("6. Gas Credits"):
         gr.Markdown("Local reciprocal gas-credit stub. In production this is privacy-preserving and global.")
         btn_earn = gr.Button("Simulate: I paid gas for a stranger → earn 1 credit")
         btn_bal = gr.Button("Show my credit balance")

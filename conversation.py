@@ -1,11 +1,29 @@
 """
-Conversation manager: start with A + B → D, later add more signers to the same D.
+Conversation manager.
+
+The rendezvous address D is derived ONLY from the shared secret, so every
+party holding the secret computes the same D independently. (The previous
+version derived it from each user's own mnemonic, which gave A and B
+different addresses.)
+
+D is a plain address that receives `intendedTo` records; nobody needs its
+private key for anything, and it never holds funds.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict
-from crypto_utils import derive_material
+from typing import Dict, List
+
+from eth_account import Account
+from eth_utils import to_checksum_address
+
 from address_factory import AddressFactory
+from crypto_utils import derive_material
+
+
+def derive_rendezvous(shared_secret: bytes) -> str:
+    """Deterministic D from the shared secret alone."""
+    key = derive_material(shared_secret, b"sos69069/rendezvous-key", 32)
+    return to_checksum_address(Account.from_key(key).address)
 
 
 @dataclass
@@ -13,9 +31,13 @@ class Conversation:
     conversation_id: bytes
     shared_secret: bytes
     rendezvous_d: str
-    my_signers: List[str] = field(default_factory=list)
-    # local view only – never leaves the device
-    known_participants: Dict[str, List[str]] = field(default_factory=dict)
+    # one-time signer accounts, held in memory only
+    my_accounts: Dict[str, Account] = field(default_factory=dict)
+    unused: List[str] = field(default_factory=list)
+
+    @property
+    def my_signers(self) -> List[str]:
+        return list(self.my_accounts.keys())
 
 
 class ConversationManager:
@@ -23,38 +45,31 @@ class ConversationManager:
         self.factory = factory
         self.conversations: Dict[bytes, Conversation] = {}
 
-    def start_conversation(self, shared_secret: bytes, my_index_base: int = 0) -> Conversation:
-        """
-        Both A and B call this with the same shared_secret.
-        They will independently derive the same D.
-        """
-        conv_id = derive_material(shared_secret, b"conv-id", 16)
-        material = derive_material(shared_secret, b"rendezvous", 32)
-
-        # Deterministic D from the shared secret
-        d_index = int.from_bytes(material[:4], "big") % 100_000
-        d_addr, _ = self.factory.new_rendezvous(d_index)
-
-        # Allocate a few one-time signers for myself
-        my_signers = []
-        for i in range(3):
-            addr, _ = self.factory.new_signer(my_index_base + i)
-            my_signers.append(addr)
+    def start_conversation(self, shared_secret: bytes, prealloc: int = 3) -> Conversation:
+        """Idempotent: calling twice with the same secret returns the same conversation."""
+        conv_id = derive_material(shared_secret, b"sos69069/conv-id", 16)
+        if conv_id in self.conversations:
+            return self.conversations[conv_id]
 
         conv = Conversation(
             conversation_id=conv_id,
             shared_secret=shared_secret,
-            rendezvous_d=d_addr,
-            my_signers=my_signers,
+            rendezvous_d=derive_rendezvous(shared_secret),
         )
+        for _ in range(prealloc):
+            self._allocate(conv)
         self.conversations[conv_id] = conv
         return conv
 
-    def add_participant(self, conv: Conversation, new_shared_material: bytes):
-        """
-        When a new party joins, they receive the conversation secret
-        (or a derived group secret) and start signing to the same D.
-        """
-        # The new party will call start_conversation-like logic
-        # with the same secret and therefore obtain the same D.
-        pass  # the real work is done on the new device
+    def _allocate(self, conv: Conversation) -> str:
+        addr, acct = self.factory.new_signer()
+        conv.my_accounts[addr] = acct
+        conv.unused.append(addr)
+        return addr
+
+    def next_signer(self, conv: Conversation):
+        """Hand out a fresh one-time signer (address, account) per message."""
+        if not conv.unused:
+            self._allocate(conv)
+        addr = conv.unused.pop(0)
+        return addr, conv.my_accounts[addr]

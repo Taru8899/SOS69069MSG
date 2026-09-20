@@ -1,15 +1,19 @@
 """
-Role-separated, one-time address factory.
-Never reuses an address across roles or conversations.
+Role-separated, one-time address factory (signer / relayer / funding).
+Never reuses an address. Counters are persisted, so restarting the app
+allocates fresh addresses instead of colliding with old ones.
+
+Note: the rendezvous address D is derived from the shared secret, not here.
 """
+
+import json
+import os
+from typing import Dict, Set, Tuple
 
 from eth_account import Account
 from eth_utils import to_checksum_address
-from typing import Tuple, Set
-import json
-import os
 
-from config import PATH_FUNDING, PATH_RELAYER, PATH_SIGNER, PATH_RENDEZVOUS
+from config import PATH_FUNDING, PATH_RELAYER, PATH_SIGNER
 
 Account.enable_unaudited_hdwallet_features()
 
@@ -19,20 +23,27 @@ class AddressFactory:
         self.mnemonic = mnemonic
         self.storage_path = storage_path
         self.used: Set[str] = set()
+        self.next_index: Dict[str, int] = {}
         self._load()
 
+    # ---- persistence ----
     def _load(self):
         if os.path.exists(self.storage_path):
             with open(self.storage_path) as f:
-                self.used = set(json.load(f))
+                data = json.load(f)
+            if isinstance(data, list):  # old format
+                self.used = set(data)
+            else:
+                self.used = set(data.get("used", []))
+                self.next_index = data.get("next", {})
 
     def _save(self):
         with open(self.storage_path, "w") as f:
-            json.dump(list(self.used), f)
+            json.dump({"used": sorted(self.used), "next": self.next_index}, f)
 
+    # ---- derivation ----
     def _derive(self, path: str, index: int) -> Tuple[str, Account]:
-        full_path = f"{path}/{index}"
-        acct = Account.from_mnemonic(self.mnemonic, account_path=full_path)
+        acct = Account.from_mnemonic(self.mnemonic, account_path=f"{path}/{index}")
         addr = to_checksum_address(acct.address)
         if addr in self.used:
             raise RuntimeError(f"Address already used: {addr}")
@@ -40,15 +51,24 @@ class AddressFactory:
         self._save()
         return addr, acct
 
-    def new_signer(self, index: int) -> Tuple[str, Account]:
-        return self._derive(PATH_SIGNER, index)
+    def _next(self, path: str) -> Tuple[str, Account]:
+        """Allocate the next never-used index on this path."""
+        index = self.next_index.get(path, 0)
+        while True:
+            try:
+                result = self._derive(path, index)
+                break
+            except RuntimeError:
+                index += 1
+        self.next_index[path] = index + 1
+        self._save()
+        return result
 
-    def new_rendezvous(self, index: int) -> Tuple[str, Account]:
-        """D address – we only need the address, never the private key on-chain."""
-        return self._derive(PATH_RENDEZVOUS, index)
+    def new_signer(self) -> Tuple[str, Account]:
+        return self._next(PATH_SIGNER)
 
-    def new_relayer(self, index: int) -> Tuple[str, Account]:
-        return self._derive(PATH_RELAYER, index)
+    def new_relayer(self) -> Tuple[str, Account]:
+        return self._next(PATH_RELAYER)
 
-    def new_funding(self, index: int) -> Tuple[str, Account]:
-        return self._derive(PATH_FUNDING, index)
+    def new_funding(self) -> Tuple[str, Account]:
+        return self._next(PATH_FUNDING)
