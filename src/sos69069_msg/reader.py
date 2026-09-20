@@ -1,15 +1,12 @@
-"""Read EVERYTHING sent to your rendezvous address D from SignatureRecorded logs.
+"""Read EVERYTHING sent to address D from SignatureRecorded logs.
 
-Every record whose intendedTo == D is shown:
-  decrypted   readable with this conversation's secret
-  plain       unencrypted text (Encrypt switch off)
-  encrypted   looks encrypted but cannot be read with this secret (someone else's, or spam)
-Your own signed-but-not-yet-submitted messages are listed as pending until they appear on chain.
+All metadata is treated as plain public text.
+Each message is shown with a short code (#XXXX = first 4 hex of payloadHash).
+Pending (signed but not yet submitted) messages appear at the top.
 """
 
 import json
 import os
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -18,15 +15,14 @@ from typing import Callable, List, Optional, Tuple
 from .abi import SIGNATURE_RECORDED_TOPIC, decode_signature_recorded
 from .config import CONTRACT_ADDRESS
 from .ethcrypto import normalize_address, parse_address
-from .message_engine import read_record
+from .message_engine import short_code
 from .rpc import RpcClient, RpcError
 
-OVERLAP = 20                 # re-scan the last blocks each time: public RPCs can lag / reorg
-DEFAULT_LOOKBACK = 1_000_000  # ~5 months on mainnet, first scan only (from_block overrides)
+OVERLAP = 20
+DEFAULT_LOOKBACK = 1_000_000
 MIN_CHUNK = 1_000
-_RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "max", "results",
-                "10000", "query returned", "more than")
-_B64 = re.compile(r"^[A-Za-z0-9_-]{22,64}$")
+_RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "max",
+                "results", "10000", "query returned", "more than")
 
 
 def short(addr: str) -> str:
@@ -42,27 +38,17 @@ class Message:
     signer: str
     submitter: str
     text: str
-    kind: str = "decrypted"      # decrypted | plain | encrypted
     payload_hash: str = ""
 
     def line(self, mine=()) -> str:
         t = datetime.fromtimestamp(self.timestamp, timezone.utc).strftime("%d %b %Y %H:%M UTC")
         who = "you" if self.signer in mine else short(self.signer)
-        if self.kind == "encrypted":
-            body = "🔒 encrypted, can't be read with this secret"
-        elif self.kind == "plain":
-            body = f"{self.text}  (unencrypted)"
-        else:
-            body = self.text
-        return f"[{t}] from {who} → D\n{body}"
+        code = short_code(self.payload_hash) if self.payload_hash else "----"
+        return f"#{code}  [{t}] from {who}\n{self.text}"
 
 
 def _addr_from_topic(topic: str) -> str:
     return normalize_address("0x" + topic[-40:])
-
-
-def _classify(metadata: str) -> str:
-    return "encrypted" if _B64.match(metadata) else "plain"
 
 
 def _is_range_error(err: Exception) -> bool:
@@ -70,94 +56,117 @@ def _is_range_error(err: Exception) -> bool:
     return any(h in m for h in _RANGE_HINTS)
 
 
-def scan(rpc: RpcClient, d: str, secret: bytes, from_block: int, to_block: int,
+def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
          chunk: Optional[int] = None,
-         progress: Optional[Callable[[str], None]] = None) -> Tuple[List[Message], int]:
-    """Returns (all messages sent to D, number that are unreadable/encrypted).
-
-    Starts with the whole range in ONE request and halves the window only when the
-    provider complains about range/result limits.
-    """
+         progress: Optional[Callable[[str], None]] = None) -> List[Message]:
+    """Return every record whose intendedTo == D (plain text only)."""
     d_topic = "0x" + parse_address(d).rjust(32, b"\x00").hex()
     contract = normalize_address(CONTRACT_ADDRESS)
     topic0 = "0x" + SIGNATURE_RECORDED_TOPIC.hex()
     chunk = chunk or max(1, to_block - from_block + 1)
     msgs: List[Message] = []
-    unreadable = 0
     start = from_block
     while start <= to_block:
         end = min(start + chunk - 1, to_block)
+        if progress:
+            progress(f"Scanning blocks {start}–{end}…")
         try:
-            logs = rpc.get_logs({"address": contract, "fromBlock": hex(start), "toBlock": hex(end),
-                                 "topics": [topic0, None, d_topic]})
+            logs = rpc.get_logs({
+                "address": contract,
+                "fromBlock": hex(start),
+                "toBlock": hex(end),
+                "topics": [topic0, None, d_topic],
+            })
         except RpcError as e:
             if not _is_range_error(e):
                 raise
             if chunk <= MIN_CHUNK:
-                raise RpcError(f"{e}. This RPC limits log queries; use another RPC URL "
-                               "(Setup, step 4) or enter a later 'scan from block'.") from e
+                raise RpcError(
+                    f"{e}. This RPC limits log queries; try another RPC URL "
+                    "or enter a later 'scan from block'."
+                ) from e
             chunk = max(MIN_CHUNK, chunk // 2)
             continue
-        for lg in logs:
+
+        for log in logs:
             try:
-                ph, _sig, ts, meta = decode_signature_recorded(bytes.fromhex(lg["data"][2:]))
+                decoded = decode_signature_recorded(log)
+                ph = decoded.get("payloadHash", "")
+                if isinstance(ph, bytes):
+                    ph = "0x" + ph.hex()
+                msgs.append(Message(
+                    block=int(log.get("blockNumber", "0x0"), 16),
+                    log_index=int(log.get("logIndex", "0x0"), 16),
+                    tx_hash=log.get("transactionHash", ""),
+                    timestamp=int(decoded.get("timestamp", 0)),
+                    signer=normalize_address(decoded["signer"]),
+                    submitter=normalize_address(decoded.get("submitter", "")),
+                    text=decoded.get("metadata", ""),
+                    payload_hash=ph,
+                ))
             except Exception:
-                continue  # malformed log data: cannot be shown at all
-            try:
-                text, kind = read_record(meta, ph, secret), "decrypted"
-            except Exception:
-                kind = _classify(meta)
-                text = "" if kind == "encrypted" else meta
-                unreadable += kind == "encrypted"
-            msgs.append(Message(int(lg["blockNumber"], 16), int(lg["logIndex"], 16),
-                                lg["transactionHash"], ts,
-                                _addr_from_topic(lg["topics"][1]),
-                                _addr_from_topic(lg["topics"][3]), text, kind, "0x" + ph.hex()))
-        if progress:
-            progress(f"Scanned blocks {from_block:,}–{end:,}")
+                continue
         start = end + 1
-    msgs.sort(key=lambda m: (m.block, m.log_index))
-    return msgs, unreadable
+    return msgs
 
 
+@dataclass
 class Inbox:
     """On-disk cache: chain messages + my pending (signed, not yet on chain) messages."""
     VERSION = 2
+    path: str = ""
+    last_block: Optional[int] = None
+    last_scan_from: Optional[int] = None
+    messages: List[Message] = field(default_factory=list)
+    outbox: List[dict] = field(default_factory=list)
 
     def __init__(self, path: str):
         self.path = path
-        self.last_block: Optional[int] = None
-        self.last_scan_from: Optional[int] = None
-        self.messages: List[Message] = []
-        self.outbox: List[dict] = []      # {"ph","text","ts","tx"}
+        self.last_block = None
+        self.last_scan_from = None
+        self.messages = []
+        self.outbox = []
         if os.path.exists(path):
             try:
                 with open(path) as f:
                     j = json.load(f)
+                self.last_block = j.get("last_block")
                 self.outbox = j.get("outbox", [])
-                if j.get("v") == self.VERSION:   # older caches dropped messages: rescan from scratch
-                    self.last_block = j.get("last_block")
-                    self.messages = [Message(**m) for m in j.get("messages", [])]
+                for m in j.get("messages", []):
+                    self.messages.append(Message(**m))
             except Exception:
                 pass
 
     def _save(self):
         with open(self.path, "w") as f:
-            json.dump({"v": self.VERSION, "last_block": self.last_block,
-                       "messages": [asdict(m) for m in self.messages], "outbox": self.outbox}, f)
+            json.dump({
+                "v": self.VERSION,
+                "last_block": self.last_block,
+                "messages": [asdict(m) for m in self.messages],
+                "outbox": self.outbox,
+            }, f)
 
-    def merge(self, new: List[Message], last_block: int) -> int:
-        seen = {(m.tx_hash, m.log_index) for m in self.messages}
-        added = [m for m in new if (m.tx_hash, m.log_index) not in seen]
-        self.messages += added
+    def merge(self, new_msgs: List[Message], latest_block: int) -> int:
+        existing = {(m.block, m.log_index) for m in self.messages}
+        added = 0
+        for m in new_msgs:
+            key = (m.block, m.log_index)
+            if key not in existing:
+                self.messages.append(m)
+                existing.add(key)
+                added += 1
         self.messages.sort(key=lambda m: (m.block, m.log_index))
-        self.last_block = last_block
+        self.last_block = latest_block
         self._save()
-        return len(added)
+        return added
 
-    # ---- my pending messages ----
     def add_pending(self, payload_hash_hex: str, text: str):
-        self.outbox.append({"ph": payload_hash_hex, "text": text, "ts": int(time.time()), "tx": ""})
+        self.outbox.append({
+            "ph": payload_hash_hex,
+            "text": text,
+            "ts": int(time.time()),
+            "tx": "",
+        })
         self._save()
 
     def mark_submitted(self, payload_hash_hex: str, tx: str):
@@ -170,32 +179,29 @@ class Inbox:
         on_chain = {m.payload_hash for m in self.messages}
         return [o for o in self.outbox if o["ph"] not in on_chain]
 
-    def render(self, d: Optional[str] = None, mine=(), limit: int = 30) -> str:
-        """Everything sent to D, newest first (pending ones on top)."""
-        parts = []
+    def render(self, d: str = "", mine=()) -> str:
+        """Everything sent to D, newest first (pending on top)."""
+        lines = []
         for o in reversed(self.pending()):
-            t = datetime.fromtimestamp(o["ts"], timezone.utc).strftime("%d %b %H:%M UTC")
-            state = "submitted, waiting to be mined" if o["tx"] else "NOT submitted yet (Relay tab)"
-            parts.append(f"⏳ [{t}] you → D\n{o['text']}\n({state})")
-        if self.messages:
-            shown = self.messages[-limit:][::-1]
-            head = (f"Latest {len(shown)} of {len(self.messages)} message(s) to D "
-                    f"{short(d) if d else ''} — newest first")
-            parts += [head] if not parts else ["— on chain —\n" + head]
-            parts += [m.line(mine) for m in shown]
-        return "\n\n".join(parts) if parts else "(no messages yet)"
+            code = short_code(o["ph"])
+            lines.append(f"#{code}  ⏳ NOT submitted yet\n{o['text']}")
+        for m in reversed(self.messages):
+            lines.append(m.line(mine))
+        if not lines:
+            return f"No messages to {d or 'D'} yet.\nSign on SEND, then submit on RELAY."
+        return "\n\n".join(lines)
 
 
-def sync(rpc: RpcClient, d: str, secret: bytes, inbox: Inbox, from_block: Optional[int] = None,
-         lookback: int = DEFAULT_LOOKBACK, progress=None) -> Tuple[int, int]:
-    """Fetch records to D since the last scan. Returns (new_messages, unreadable_encrypted)."""
+def sync(rpc: RpcClient, d: str, inbox: Inbox, from_block: Optional[int] = None,
+         progress: Optional[Callable[[str], None]] = None) -> int:
+    """Fetch records to D since last scan. Returns number of new messages."""
     latest = rpc.block_number()
     if from_block is not None:
         start = from_block
     elif inbox.last_block is not None:
         start = max(0, inbox.last_block + 1 - OVERLAP)
     else:
-        start = max(0, latest - lookback)
-    msgs, unreadable = scan(rpc, d, secret, start, latest, progress=progress)
+        start = max(0, latest - DEFAULT_LOOKBACK)
+    msgs = scan(rpc, d, start, latest, progress=progress)
     inbox.last_scan_from = start
-    return inbox.merge(msgs, latest), unreadable
+    return inbox.merge(msgs, latest)
