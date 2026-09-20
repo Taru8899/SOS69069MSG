@@ -47,6 +47,26 @@ def _from_hex(s: str) -> bytes:
 
 class SOS69069MsgApp(toga.App):
     def startup(self):
+        """Protected entry — any crash is shown on screen instead of silent exit."""
+        try:
+            self._real_startup()
+        except Exception as e:
+            import traceback
+            err = traceback.format_exc()
+            try:
+                log = Path(getattr(self.paths, "data", ".") or ".") / "crash.txt"
+                log.parent.mkdir(parents=True, exist_ok=True)
+                log.write_text(err)
+            except Exception:
+                pass
+            self.main_window = toga.MainWindow(title="Startup Crash")
+            box = toga.Box(style=Pack(direction=COLUMN, margin=10))
+            box.add(toga.Label("The app crashed during startup. Share this error:"))
+            box.add(toga.MultilineTextInput(value=err, readonly=True, style=Pack(flex=1, height=400)))
+            self.main_window.content = box
+            self.main_window.show()
+
+    def _real_startup(self):
         self.data_dir = Path(self.paths.data)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.seed_file = self.data_dir / "seed.hex"
