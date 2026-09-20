@@ -1,9 +1,9 @@
 """Runs without eth-account: python -m unittest discover tests"""
 import os, sys, unittest
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from cryptography.exceptions import InvalidTag
-from crypto_utils import (MAX_PLAINTEXT_BYTES, derive_material, open_message,
+from sos69069_msg.crypto_utils import (MAX_PLAINTEXT_BYTES, derive_material, open_message,
                           random_payload_hash, seal_message)
 
 
