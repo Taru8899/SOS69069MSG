@@ -30,8 +30,9 @@ for px in (48, 72, 96, 144, 192):
     big.putalpha(mask)
     save(big.resize((px, px), Image.LANCZOS), "round", px)
 
+BG = src.getpixel((0, 0))                 # the logo's own flat green
 for px in (108, 162, 216, 324, 432):     # adaptive foreground: logo inside the 66/108 safe zone
-    canvas = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    canvas = Image.new("RGBA", (px, px), BG)   # full-bleed green, so any launcher mask looks seamless
     inner = int(px * 0.62)
     logo = src.resize((inner, inner), Image.LANCZOS)
     canvas.paste(logo, ((px - inner) // 2, (px - inner) // 2))
