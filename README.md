@@ -1,4 +1,4 @@
-# sos69069 msg
+# SOS69069 MSG
 
 Messenger for the SOS 69069 ledger on Ethereum mainnet
 (`0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A`).
