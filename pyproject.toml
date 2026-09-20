@@ -1,0 +1,28 @@
+[tool.briefcase]
+project_name = "sos69069 msg"
+bundle = "org.sos69069"
+version = "0.2.0"
+url = "https://github.com/YOUR-USER/sos69069-msg"
+license.file = "LICENSE"
+author = "SOS 69069"
+author_email = "you@example.com"
+
+[tool.briefcase.app.sos69069-msg]
+formal_name = "sos69069 msg"
+description = "sos69069 msg: signed messages on the SOS 69069 ledger"
+sources = ["src/sos69069_msg"]
+# `cryptography` has an Android wheel; eth-account / web3 do NOT (pydantic-core, ckzg),
+# which is why the core is dependency-light.
+requires = ["cryptography"]
+
+[tool.briefcase.app.sos69069-msg.macOS]
+requires = ["toga-cocoa"]
+
+[tool.briefcase.app.sos69069-msg.linux]
+requires = ["toga-gtk"]
+
+[tool.briefcase.app.sos69069-msg.windows]
+requires = ["toga-winforms"]
+
+[tool.briefcase.app.sos69069-msg.android]
+requires = ["toga-android"]
