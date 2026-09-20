@@ -190,6 +190,28 @@ class TestRelayer(unittest.TestCase):
         self.assertEqual(new, 0)
         self.assertEqual(int(rpc.log_calls[0]["fromBlock"], 16), 1001)
 
+    def test_inbox_render_newest_first_and_labels_you(self):
+        rpc = FakeRpc(); d = self.conv.rendezvous_d
+        k2 = self.mgr.next_signer(self.conv)
+        ph2, meta2, sig2 = prepare_and_sign(k2, d, "second one", self.secret)
+        rpc.logs = [
+            self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
+            self._log(995, 0, k2.address, d, ph2, sig2, 1700000500, meta2),
+        ]
+        inbox = Inbox(os.path.join(self.tmp, "inbox2.json"))
+        sync(rpc, d, self.secret, inbox)
+        out = inbox.render(d, mine={self.key.address})
+        self.assertLess(out.index("second one"), out.index("hi there"))          # newest first
+        self.assertIn("from you", out)                                            # my signer labelled
+        self.assertIn("from " + k2.address[:6], out)                              # other signer shown short
+        self.assertIn("→ D", out)
+        self.assertIn("Latest 2 of 2", out)
+        self.assertEqual(inbox.render(d, limit=1).count("[") , 1)                 # limit works
+
+    def test_my_signer_addresses(self):
+        f = self.mgr.factory
+        self.assertEqual(f.my_signer_addresses(), set(self.conv.my_signers))
+
     def test_rpc_url_must_be_https(self):
         with self.assertRaises(RpcError): _check_url("http://example.com")
         _check_url("https://example.com"); _check_url("http://127.0.0.1:8545")
