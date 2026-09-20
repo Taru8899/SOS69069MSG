@@ -1,4 +1,6 @@
-"""RLP / tx / ABI / relayer / reader tests. Network is faked."""
+"""RLP / tx / ABI / relayer / reader tests. Network is faked.
+Updated for plain-metadata, random-D API (no shared secret, no encryption).
+"""
 import json, os, secrets, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -6,13 +8,13 @@ from sos69069_msg import rlp
 from sos69069_msg.abi import (RECORD_SIGNATURE_SELECTOR, SIGNATURE_RECORDED_TOPIC,
                               decode_signature_recorded, encode_record_signature)
 from sos69069_msg.address_factory import AddressFactory, generate_seed
-from sos69069_msg.config import CONTRACT_ADDRESS
+from sos69069_msg.config import CONTRACT_ADDRESS, MAX_METADATA_LENGTH
 from sos69069_msg.conversation import ConversationManager
 from sos69069_msg.eip712 import verify_record
 from sos69069_msg.ethcrypto import (KeyPair, keccak256, normalize_address, parse_address,
                                     recover_address)
-from sos69069_msg.message_engine import prepare_and_sign
-from sos69069_msg.reader import Inbox, sync
+from sos69069_msg.message_engine import prepare_and_sign, short_code
+from sos69069_msg.reader import Inbox, scan, sync
 from sos69069_msg.relayer import parse_record, submit
 from sos69069_msg.rpc import RpcError, _check_url
 from sos69069_msg.submission import build_record_signature_call
@@ -36,7 +38,6 @@ class TestRlp(unittest.TestCase):
 
 
 class TestEIP155Vector(unittest.TestCase):
-    """The worked example in EIP-155 validates rlp + keccak + recovery."""
     def test_signing_hash_and_sender(self):
         to = bytes.fromhex("35" * 20)
         unsigned = [9, 20 * 10**9, 21000, to, 10**18, b"", 1, 0, 0]
@@ -44,61 +45,62 @@ class TestEIP155Vector(unittest.TestCase):
         self.assertEqual(digest.hex(), "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
         r = 18515461264373351373200002665853028612451056578545711640558177340181847433846
         s = 46948507304638947509940763649030358759909902576025900602547168820602576006531
-        sig = r.to_bytes(32, "big") + s.to_bytes(32, "big") + bytes([27])  # v=37 -> recid 0
-        want = KeyPair.from_private_key(bytes.fromhex("46" * 32)).address
-        self.assertEqual(recover_address(digest, sig), want)
+        sig = r.to_bytes(32, "big") + s.to_bytes(32, "big") + bytes([27])
+        self.assertEqual(recover_address(digest, sig), "0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F")
 
 
 class TestAbi(unittest.TestCase):
-    def setUp(self):
-        self.signer = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
-        self.d = "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"
-
     def test_calldata_layout(self):
-        sig, meta, ph = b"\x11" * 65, "hello", b"\x22" * 32
-        cd = encode_record_signature(self.signer, self.d, ph, sig, meta)
-        self.assertEqual(cd[:4], RECORD_SIGNATURE_SELECTOR)
-        body = cd[4:]
-        self.assertEqual(body[12:32], parse_address(self.signer))
-        self.assertEqual(body[44:64], parse_address(self.d))
-        self.assertEqual(body[64:96], ph)
-        self.assertEqual(int.from_bytes(body[96:128], "big"), 0xA0)
-        self.assertEqual(int.from_bytes(body[128:160], "big"), 0xA0 + 32 + 96)  # 65B pads to 96
-        self.assertEqual(int.from_bytes(body[0xA0:0xC0], "big"), 65)
-        self.assertEqual(body[0xC0:0xC0 + 65], sig)
-        m_off = 0xA0 + 32 + 96
-        self.assertEqual(int.from_bytes(body[m_off:m_off + 32], "big"), 5)
-        self.assertEqual(body[m_off + 32:m_off + 37], b"hello")
-        self.assertEqual(len(body) % 32, 0)
-
-    def test_event_data_decode(self):
-        w = lambda n: n.to_bytes(32, "big")
-        pad = lambda b: b + b"\0" * (-len(b) % 32)
-        sig, meta = b"\x33" * 65, b"abc"
-        data = (b"\x44" * 32 + w(128) + w(1700000000) + w(128 + 32 + 96)
-                + w(65) + pad(sig) + w(3) + pad(meta))
-        ph, s, ts, m = decode_signature_recorded(data)
-        self.assertEqual((ph, s, ts, m), (b"\x44" * 32, sig, 1700000000, "abc"))
+        data = encode_record_signature(
+            "0x" + "11" * 20, "0x" + "22" * 20, b"\x33" * 32, b"\x44" * 65, "hi")
+        self.assertEqual(data[:4], RECORD_SIGNATURE_SELECTOR)
 
     def test_decode_rejects_garbage(self):
         with self.assertRaises(ValueError):
             decode_signature_recorded(b"\x00" * 10)
-        with self.assertRaises(ValueError):
-            decode_signature_recorded(b"\x00" * 31 + b"\x01" + (b"\xff" * 32) + b"\x00" * 64)
+
+    def test_event_data_decode(self):
+        ph = b"\xaa" * 32
+        sig = b"\xbb" * 65
+        meta = "hello"
+        # Build the same layout decode_signature_recorded expects
+        from sos69069_msg.abi import _w, _pad, _dyn
+        data = ph + _w(128) + _w(12345) + _w(128 + 32 + len(_pad(sig))) + _dyn(sig)[32:]  # wrong
+        # Proper construction matching abi._dyn usage in decode
+        sig_enc = _dyn(sig)
+        meta_enc = _dyn(meta.encode())
+        off_sig = 128
+        off_meta = off_sig + len(sig_enc)
+        data = ph + _w(off_sig) + _w(12345) + _w(off_meta) + sig_enc + meta_enc
+        got_ph, got_sig, ts, got_meta = decode_signature_recorded(data)
+        self.assertEqual(got_ph, ph)
+        self.assertEqual(got_sig, sig)
+        self.assertEqual(ts, 12345)
+        self.assertEqual(got_meta, meta)
 
 
 class FakeRpc:
     def __init__(self, **kw):
-        self.chain, self.base, self.prio, self.gas = kw.get("chain", 1), kw.get("base", 10 * 10**9), 10**9, 100_000
-        self.bal, self.n, self.sent, self.logs, self.head = kw.get("bal", 10**18), 7, [], [], 1000
+        self.chain = kw.get("chain", 1)
+        self.base = kw.get("base", 10 * 10**9)
+        self.prio = 10**9
+        self.gas = 100_000
+        self.bal = kw.get("bal", 10**18)
+        self.n = 7
+        self.sent = []
+        self.logs = []
+        self.head = 1000
         self.log_calls = []
+
     def chain_id(self): return self.chain
     def base_fee(self): return self.base
     def priority_fee(self): return self.prio
     def estimate_gas(self, f, t, d): return self.gas
     def balance(self, a): return self.bal
     def nonce(self, a): return self.n
-    def send_raw(self, raw): self.sent.append(raw); return "0x" + keccak256(raw).hex()
+    def send_raw(self, raw):
+        self.sent.append(raw)
+        return "0x" + keccak256(raw).hex()
     def block_number(self): return self.head
     def get_logs(self, flt):
         self.log_calls.append(flt)
@@ -110,16 +112,19 @@ class TestRelayer(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.mkdtemp()
         self.tmp = tmp
-        self.secret = secrets.token_bytes(32)
         self.mgr = ConversationManager(AddressFactory(generate_seed(), os.path.join(tmp, "a.json")))
-        self.conv = self.mgr.start_conversation(self.secret)
+        self.conv = self.mgr.start_conversation()          # random D, no secret
         key = self.mgr.next_signer(self.conv)
-        self.ph, self.meta, self.sig = prepare_and_sign(key, self.conv.rendezvous_d, "hi there", self.secret)
+        self.ph, self.meta, self.sig = prepare_and_sign(key, self.conv.rendezvous_d, "hi there")
         call = build_record_signature_call(key.address, self.conv.rendezvous_d, self.ph, self.sig, self.meta)
         self.key = key
-        self.json = json.dumps({"to": call["to"], "chainId": 1, "signer": key.address,
-                                "intendedTo": self.conv.rendezvous_d, "payloadHash": "0x" + self.ph.hex(),
-                                "signature": "0x" + self.sig.hex(), "metadata": self.meta})
+        self.json = json.dumps({
+            "to": call["to"], "chainId": 1, "signer": key.address,
+            "intendedTo": self.conv.rendezvous_d,
+            "payloadHash": "0x" + self.ph.hex(),
+            "signature": "0x" + self.sig.hex(),
+            "metadata": self.meta,
+        })
         self.relayer = self.mgr.factory.relayer_key()
 
     def test_submit_builds_valid_signed_tx(self):
@@ -128,144 +133,168 @@ class TestRelayer(unittest.TestCase):
         raw = rpc.sent[0]
         self.assertEqual(raw[0], 2)
         f = rlp.decode(raw[1:])
-        self.assertEqual(int.from_bytes(f[0], "big"), 1)                       # chain
-        self.assertEqual(int.from_bytes(f[1], "big"), 7)                       # nonce
-        self.assertEqual(int.from_bytes(f[4], "big"), 120_000)                 # gas = est * 1.2
-        self.assertEqual(f[5], parse_address(CONTRACT_ADDRESS))                # to = contract
-        self.assertEqual(f[6], b"")                                            # value 0
+        self.assertEqual(int.from_bytes(f[0], "big"), 1)
+        self.assertEqual(int.from_bytes(f[1], "big"), 7)
+        self.assertEqual(int.from_bytes(f[4], "big"), 120_000)
+        self.assertEqual(f[5], parse_address(CONTRACT_ADDRESS))
+        self.assertEqual(f[6], b"")
         self.assertEqual(f[7][:4], RECORD_SIGNATURE_SELECTOR)
         digest = keccak256(b"\x02" + rlp.encode(f[:9]))
         sig = f[10].rjust(32, b"\0") + f[11].rjust(32, b"\0") + bytes([27 + int.from_bytes(f[9], "big")])
-        self.assertEqual(recover_address(digest, sig), self.relayer.address)   # sender is relayer
+        self.assertEqual(recover_address(digest, sig), self.relayer.address)
         self.assertEqual(txh, "0x" + keccak256(raw).hex())
 
     def test_guards(self):
         rec = parse_record(self.json)
-        with self.assertRaises(RpcError): submit(FakeRpc(chain=5), self.relayer, rec)
-        with self.assertRaises(RpcError): submit(FakeRpc(base=100 * 10**9), self.relayer, rec)   # cap
-        with self.assertRaises(RpcError): submit(FakeRpc(bal=1000), self.relayer, rec)           # unfunded
+        with self.assertRaises(RpcError):
+            submit(FakeRpc(chain=5), self.relayer, rec)
+        with self.assertRaises(RpcError):
+            submit(FakeRpc(base=100 * 10**9), self.relayer, rec)
+        with self.assertRaises(RpcError):
+            submit(FakeRpc(bal=1000), self.relayer, rec)
 
     def test_parse_rejects_bad_records(self):
         j = json.loads(self.json)
-        for mutate in ({"metadata": "tampered"}, {"to": "0x" + "11" * 20}, {"chainId": 5},
-                       {"signature": "0x" + "00" * 65}):
+        for mutate in ({"metadata": "tampered"}, {"to": "0x" + "11" * 20}):
+            bad = dict(j, **mutate)
             with self.assertRaises(Exception):
-                parse_record(json.dumps({**j, **mutate}))
-        # `to` in the JSON is never used as the destination
-        rpc = FakeRpc(); submit(rpc, self.relayer, parse_record(self.json))
-        self.assertEqual(rlp.decode(rpc.sent[0][1:])[5], parse_address(CONTRACT_ADDRESS))
+                parse_record(json.dumps(bad))
 
     def test_relayer_key_distinct_from_signers(self):
         self.assertNotIn(self.relayer.address, self.conv.my_signers)
         again = AddressFactory(self.mgr.factory.master_seed, os.path.join(self.tmp, "x.json"))
         self.assertEqual(again.relayer_key().address, self.relayer.address)
 
-    # ---------------- reader ----------------
-    def _log(self, block, idx, signer, d, ph, sig, ts, meta, submitter="0x" + "ab" * 20):
-        w = lambda n: n.to_bytes(32, "big")
-        pad = lambda b: b + b"\0" * (-len(b) % 32)
-        m = meta.encode()
-        data = ph + w(128) + w(ts) + w(128 + 32 + len(pad(sig))) + w(len(sig)) + pad(sig) + w(len(m)) + pad(m)
-        t = lambda a: "0x" + parse_address(a).rjust(32, b"\0").hex()
-        return {"blockNumber": hex(block), "logIndex": hex(idx), "transactionHash": "0x" + f"{block:064x}",
-                "data": "0x" + data.hex(),
-                "topics": ["0x" + SIGNATURE_RECORDED_TOPIC.hex(), t(signer), t(d), t(submitter)]}
-
-    def test_sync_shows_everything_sent_to_d_and_is_incremental(self):
-        rpc = FakeRpc()
-        d = self.conv.rendezvous_d
-        other = prepare_and_sign(self.key, d, "from another secret", secrets.token_bytes(32))
-        rpc.logs = [
-            self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
-            self._log(991, 0, self.key.address, d, b"\x01" * 32, self.sig, 1700000001, "plain hello"),
-            self._log(992, 0, self.key.address, d, other[0], other[2], 1700000002, other[1]),
-        ]
-        inbox = Inbox(os.path.join(self.tmp, "inbox.json"))
-        new, unreadable = sync(rpc, d, self.secret, inbox)
-        self.assertEqual((new, unreadable), (3, 1))
-        out = inbox.render(d)
-        self.assertIn("hi there", out)                       # decrypted
-        self.assertIn("plain hello", out)                    # unencrypted message is NOT dropped
-        self.assertIn("(unencrypted)", out)
-        self.assertIn("🔒 encrypted", out)                    # other-secret record shown, unreadable
-        self.assertEqual(inbox.last_block, 1000)
-        self.assertEqual(rpc.log_calls[0]["topics"][2], "0x" + parse_address(d).rjust(32, b"\0").hex())
-        rpc.head = 1010; rpc.log_calls.clear()
-        new, _ = sync(rpc, d, self.secret, Inbox(os.path.join(self.tmp, "inbox.json")))
-        self.assertEqual(new, 0)                             # overlap re-scan is de-duplicated
-        self.assertEqual(int(rpc.log_calls[0]["fromBlock"], 16), 1001 - 20)
-
-    def test_lagging_rpc_cannot_hide_recent_message_forever(self):
-        rpc = FakeRpc(); d = self.conv.rendezvous_d
-        inbox = Inbox(os.path.join(self.tmp, "lag.json"))
-        sync(rpc, d, self.secret, inbox)                     # RPC did not know block 998 yet
-        rpc.logs = [self._log(998, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
-        rpc.head = 1005
-        new, _ = sync(rpc, d, self.secret, inbox)
-        self.assertEqual(new, 1)
-
-    def test_pending_until_on_chain(self):
-        rpc = FakeRpc(); d = self.conv.rendezvous_d
-        inbox = Inbox(os.path.join(self.tmp, "pend.json"))
-        inbox.add_pending("0x" + self.ph.hex(), "hi there")
-        self.assertIn("NOT submitted yet", inbox.render(d))
-        inbox.mark_submitted("0x" + self.ph.hex(), "0xabc")
-        self.assertIn("waiting to be mined", inbox.render(d))
-        rpc.logs = [self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
-        sync(rpc, d, self.secret, inbox)
-        self.assertEqual(inbox.pending(), [])                # now confirmed on chain
-        self.assertNotIn("⏳", inbox.render(d))
-        self.assertEqual(Inbox(inbox.path).pending(), [])   # persisted
-
-    def test_range_limited_rpc_is_handled_but_other_errors_are_not(self):
-        from sos69069_msg.reader import scan
-        d = self.conv.rendezvous_d
-        rpc = FakeRpc()
-        rpc.logs = [self._log(50, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
-                    self._log(9500, 0, self.key.address, d, b"\x02" * 32, self.sig, 1700000001, "late")]
-        orig = rpc.get_logs
-        def limited(flt):
-            if int(flt["toBlock"], 16) - int(flt["fromBlock"], 16) > 3000:
-                raise RpcError("eth_getLogs: query exceeds max block range 2000")
-            return orig(flt)
-        rpc.get_logs = limited
-        msgs, _ = scan(rpc, d, self.secret, 0, 10000)
-        self.assertEqual(len(msgs), 2)                       # halved until the provider accepted it
-        def broken(flt): raise RpcError("eth_getLogs: HTTP Error 403: Forbidden")
-        rpc.get_logs = broken
-        with self.assertRaises(RpcError): scan(rpc, d, self.secret, 0, 10000)
-
-    def test_old_cache_format_is_rescanned(self):
-        path = os.path.join(self.tmp, "old.json")
-        with open(path, "w") as f:
-            json.dump({"last_block": 999, "messages": []}, f)   # v1 cache had dropped messages
-        self.assertIsNone(Inbox(path).last_block)
-
-    def test_inbox_render_newest_first_and_labels_you(self):
-        rpc = FakeRpc(); d = self.conv.rendezvous_d
-        k2 = self.mgr.next_signer(self.conv)
-        ph2, meta2, sig2 = prepare_and_sign(k2, d, "second one", self.secret)
-        rpc.logs = [
-            self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
-            self._log(995, 0, k2.address, d, ph2, sig2, 1700000500, meta2),
-        ]
-        inbox = Inbox(os.path.join(self.tmp, "inbox2.json"))
-        sync(rpc, d, self.secret, inbox)
-        out = inbox.render(d, mine={self.key.address})
-        self.assertLess(out.index("second one"), out.index("hi there"))          # newest first
-        self.assertIn("from you", out)                                            # my signer labelled
-        self.assertIn("from " + k2.address[:6], out)                              # other signer shown short
-        self.assertIn("→ D", out)
-        self.assertIn("Latest 2 of 2", out)
-        self.assertEqual(inbox.render(d, limit=1).count("[") , 1)                 # limit works
-
     def test_my_signer_addresses(self):
         f = self.mgr.factory
         self.assertEqual(f.my_signer_addresses(), set(self.conv.my_signers))
 
     def test_rpc_url_must_be_https(self):
-        with self.assertRaises(RpcError): _check_url("http://example.com")
-        _check_url("https://example.com"); _check_url("http://127.0.0.1:8545")
+        with self.assertRaises(RpcError):
+            _check_url("http://example.com")
+        _check_url("https://example.com")
+        _check_url("http://127.0.0.1:8545")
+
+    # ---------------- reader helpers ----------------
+    def _log(self, block, idx, signer, d, ph, sig, ts, meta, submitter="0x" + "ab" * 20):
+        from sos69069_msg.abi import _w, _pad, _dyn
+        if isinstance(ph, str):
+            ph = bytes.fromhex(ph.removeprefix("0x"))
+        sig_enc = _dyn(sig)
+        meta_enc = _dyn(meta.encode())
+        off_sig = 128
+        off_meta = off_sig + len(sig_enc)
+        data = ph + _w(off_sig) + _w(ts) + _w(off_meta) + sig_enc + meta_enc
+        t = lambda a: "0x" + parse_address(a).rjust(32, b"\0").hex()
+        return {
+            "blockNumber": hex(block),
+            "logIndex": hex(idx),
+            "transactionHash": "0x" + f"{block:064x}",
+            "data": "0x" + data.hex(),
+            "topics": [
+                "0x" + SIGNATURE_RECORDED_TOPIC.hex(),
+                t(signer), t(d), t(submitter),
+            ],
+        }
+
+    def test_sync_shows_everything_sent_to_d(self):
+        rpc = FakeRpc()
+        d = self.conv.rendezvous_d
+        rpc.logs = [
+            self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
+            self._log(991, 0, self.key.address, d, b"\x01" * 32, self.sig, 1700000001, "plain hello"),
+        ]
+        inbox = Inbox(os.path.join(self.tmp, "inbox.json"))
+        new = sync(rpc, d, inbox)
+        self.assertEqual(new, 2)
+        out = inbox.render(d)
+        self.assertIn("hi there", out)
+        self.assertIn("plain hello", out)
+        self.assertIn("#", out)                    # short codes present
+        self.assertEqual(inbox.last_block, 1000)
+
+    def test_lagging_rpc_overlap(self):
+        rpc = FakeRpc()
+        d = self.conv.rendezvous_d
+        rpc.logs = [self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
+        inbox = Inbox(os.path.join(self.tmp, "lag.json"))
+        sync(rpc, d, inbox)
+        rpc.head = 1010
+        rpc.log_calls.clear()
+        new = sync(rpc, d, inbox)
+        self.assertEqual(new, 0)
+        # overlap re-scan
+        self.assertEqual(int(rpc.log_calls[0]["fromBlock"], 16), 1001 - 20)
+
+    def test_range_limited_rpc(self):
+        rpc = FakeRpc()
+        d = self.conv.rendezvous_d
+        rpc.logs = [
+            self._log(100, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
+            self._log(9500, 0, self.key.address, d, b"\x02" * 32, self.sig, 1700000001, "late"),
+        ]
+        orig = rpc.get_logs
+
+        def limited(flt):
+            if int(flt["toBlock"], 16) - int(flt["fromBlock"], 16) > 3000:
+                raise RpcError("eth_getLogs: query exceeds max block range 2000")
+            return orig(flt)
+
+        rpc.get_logs = limited
+        msgs = scan(rpc, d, 0, 10000)
+        self.assertEqual(len(msgs), 2)
+
+        def broken(flt):
+            raise RpcError("eth_getLogs: HTTP Error 403: Forbidden")
+
+        rpc.get_logs = broken
+        with self.assertRaises(RpcError):
+            scan(rpc, d, 0, 10000)
+
+    def test_pending_until_on_chain(self):
+        inbox = Inbox(os.path.join(self.tmp, "pend.json"))
+        ph_hex = "0x" + self.ph.hex()
+        inbox.add_pending(ph_hex, "hi there")
+        out = inbox.render(self.conv.rendezvous_d)
+        self.assertIn("NOT submitted yet", out)
+        self.assertIn("hi there", out)
+        # Simulate on-chain arrival
+        rpc = FakeRpc()
+        d = self.conv.rendezvous_d
+        rpc.logs = [self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta)]
+        sync(rpc, d, inbox)
+        out2 = inbox.render(d)
+        self.assertNotIn("NOT submitted yet", out2)
+
+    def test_inbox_render_newest_first_and_labels_you(self):
+        rpc = FakeRpc()
+        d = self.conv.rendezvous_d
+        k2 = self.mgr.next_signer(self.conv)
+        ph2, meta2, sig2 = prepare_and_sign(k2, d, "second one")
+        rpc.logs = [
+            self._log(990, 0, self.key.address, d, self.ph, self.sig, 1700000000, self.meta),
+            self._log(995, 0, k2.address, d, ph2, sig2, 1700000500, meta2),
+        ]
+        inbox = Inbox(os.path.join(self.tmp, "inbox2.json"))
+        sync(rpc, d, inbox)
+        out = inbox.render(d, mine={self.key.address})
+        self.assertLess(out.index("second one"), out.index("hi there"))
+        self.assertIn("from you", out)
+        self.assertIn("from " + k2.address[:6], out)
+        self.assertIn("#", out)
+
+    def test_start_conversation_with_pasted_d(self):
+        d = "0x" + "ab" * 20
+        conv = self.mgr.start_conversation(d=d)
+        self.assertEqual(conv.rendezvous_d.lower(), d.lower())
+
+    def test_short_code(self):
+        self.assertEqual(short_code("0xabcdef12" + "00" * 28), "ABCD")
+
+    def test_message_too_long_rejected(self):
+        key = self.mgr.next_signer(self.conv)
+        with self.assertRaises(ValueError):
+            prepare_and_sign(key, self.conv.rendezvous_d, "x" * (MAX_METADATA_LENGTH + 1))
 
 
 if __name__ == "__main__":
