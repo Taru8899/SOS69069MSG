@@ -20,7 +20,7 @@ from toga.style import Pack
 from toga.style.pack import COLUMN, ROW
 
 from .address_factory import AddressFactory, generate_seed
-from .config import CHAIN_ID, CONTRACT_ADDRESS, MAX_METADATA_LENGTH
+from .config import CHAIN_ID, CONTRACT_ADDRESS, DEFAULT_ETHERSCAN_KEY, MAX_METADATA_LENGTH
 from .conversation import ConversationManager
 from .eip712 import verify_record
 from .logo import logo_bytes
@@ -45,6 +45,7 @@ TAB = "#3A4540"
 TAB_ACTIVE = "#05AA34"
 TXT = "#FFFFFF"
 MUTED = "#A8B5B0"
+PAGE = 10           # message cards shown at first (and per 'Show more')
 SIDE = 18          # horizontal padding — keeps text on screen
 
 
@@ -154,7 +155,9 @@ class SOS69069MsgApp(toga.App):
         # ---------- CHECK ----------
         self.d_in = _input(placeholder="D address (0x…)")
         self.check_status = _label("", muted=False, size=15, bold=True)
-        self.messages_out = _panel(400)
+        self.msg_list = _col([])          # message cards go here
+        self.shown = PAGE                 # how many cards are visible
+        self._check_d = ""
         self.from_in = _input(placeholder="Scan from block (optional)")
         check = _col([
             _title("CHECK"),
@@ -163,7 +166,7 @@ class SOS69069MsgApp(toga.App):
             _button("CHECK", self.do_check),
             self.check_status,
             _label("Messages", muted=False, size=17, bold=True, pad=(16, SIDE, 6, SIDE)),
-            self.messages_out,
+            self.msg_list,
             _button("Send", self.goto_send, primary=False),
             self.from_in,
         ])
@@ -216,7 +219,7 @@ class SOS69069MsgApp(toga.App):
         self.seed_in = _input(placeholder="Paste 64-hex seed to import")
         self.conv_out = _panel(130)
         self.rpc_in = _input(value=self.settings["rpc_url"])
-        self.es_in = _input(value=self.settings.get("etherscan_key", ""),
+        self.es_in = _input(value=self.settings.get("etherscan_key") or DEFAULT_ETHERSCAN_KEY,
                             placeholder="Etherscan API key (for CHECK)")
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
         self.net_status = _label("", muted=False, size=15, bold=True)
@@ -240,9 +243,10 @@ class SOS69069MsgApp(toga.App):
                 lambda: self.conv.rendezvous_d if self.conv else "", "D", self.copy_status),
                 primary=False),
             _title("Network"),
-            _label("Etherscan API key: CHECK reads messages through Etherscan (more reliable "
-                   "than a public RPC). Stored only on this phone.", size=14),
+            _label("Etherscan API key (pre-filled). CHECK reads messages through Etherscan. "
+                   "If it stops working, paste your own key here and Save.", size=14),
             self.es_in,
+            _button("Reset to default key", self.reset_key, primary=False),
             _label("RPC URL: used for SEND / RELAY (sending transactions) and as CHECK's fallback.",
                    size=14),
             self.rpc_in,
@@ -346,12 +350,14 @@ class SOS69069MsgApp(toga.App):
 
     # ------------------------------------------------------------------ settings / seed
     def _load_settings(self):
-        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI, "etherscan_key": ""}
+        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI, "etherscan_key": DEFAULT_ETHERSCAN_KEY}
         if self.settings_file.exists():
             try:
                 s.update(json.loads(self.settings_file.read_text()))
             except Exception:
                 pass
+        if not (s.get("etherscan_key") or "").strip():
+            s["etherscan_key"] = DEFAULT_ETHERSCAN_KEY
         return s
 
     def _save_settings(self):
@@ -364,22 +370,29 @@ class SOS69069MsgApp(toga.App):
             if cap <= 0:
                 raise ValueError("cap must be > 0")
             self.settings.update({"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap,
-                                  "etherscan_key": self.es_in.value.strip()})
+                                  "etherscan_key": self.es_in.value.strip() or DEFAULT_ETHERSCAN_KEY})
+            self.es_in.value = self.settings["etherscan_key"]
             self._save_settings()
-            self.net_status.text = ("Saved ✔ CHECK will use Etherscan." if self.settings["etherscan_key"]
-                                    else "Saved ✔ (no Etherscan key: CHECK uses the RPC.)")
+            self.net_status.text = "Saved ✔"
         except Exception as e:
             self.net_status.text = f"Error: {e}"
 
     def _rpc(self) -> RpcClient:
         return RpcClient(self.settings["rpc_url"])
 
+    def reset_key(self, widget, **kwargs):
+        self.settings["etherscan_key"] = DEFAULT_ETHERSCAN_KEY
+        self.es_in.value = DEFAULT_ETHERSCAN_KEY
+        self._save_settings()
+        self.net_status.text = "Default Etherscan key restored ✔"
+
     def _check_sources(self):
         """Backends for CHECK, best first: Etherscan (if a key is set), then the RPC."""
         out = []
-        key = (self.settings.get("etherscan_key") or "").strip()
-        if key:
-            out.append(("Etherscan", lambda: EtherscanClient(key, CHAIN_ID)))
+        mine = (self.settings.get("etherscan_key") or "").strip()
+        for key in [k for k in dict.fromkeys([mine, DEFAULT_ETHERSCAN_KEY]) if k]:   # yours first
+            label = "Etherscan" if key == mine else "Etherscan (default key)"
+            out.append((label, lambda key=key: EtherscanClient(key, CHAIN_ID)))
         out.append(("RPC", self._rpc))
         return out
 
@@ -428,7 +441,8 @@ class SOS69069MsgApp(toga.App):
             self.conv = self.mgr.start_conversation()
             self.inbox = Inbox(str(self.data_dir / f"inbox_{self.conv.rendezvous_d[2:10]}.json"))
             self.d_in.value = self.conv.rendezvous_d
-            self.messages_out.value = self.inbox.render(self.conv.rendezvous_d)
+            self.shown = PAGE
+            self._show_messages(self.conv.rendezvous_d)
             self.conv_out.value = (
                 f"New D ready:\n{self.conv.rendezvous_d}\n\n"
                 f"Share this address with the other person.\n"
@@ -470,6 +484,7 @@ class SOS69069MsgApp(toga.App):
             return
         self._refreshing = True
         self._refresh_started = time.monotonic()
+        self.shown = PAGE
         self.check_status.text = "Scanning messages to %s..." % d[:10]
         loop = asyncio.get_running_loop()
 
@@ -496,11 +511,10 @@ class SOS69069MsgApp(toga.App):
                     msg = str(e)
                     errors.append(msg if msg.lower().startswith(name.lower()) else f"{name}: {msg}")
             if used is None:
-                hint = ("" if (self.settings.get("etherscan_key") or "").strip() else
-                        "\nTip: add an Etherscan API key in SETUP → Network.")
+                hint = "\nIf Etherscan reports an invalid key or rate limit, paste your own key in SETUP → Network."
                 raise RuntimeError(" | ".join(errors) + hint)
             mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
-            self.messages_out.value = inbox.render(d, mine)
+            self._show_messages(d)
             total = len(inbox.messages) + len(inbox.pending())
             if total == 0:
                 self.check_status.text = (
@@ -513,6 +527,95 @@ class SOS69069MsgApp(toga.App):
             self.check_status.text = "Error: %s: %s" % (type(e).__name__, e)
         finally:
             self._refreshing = False
+
+    # ------------------------------------------------------------------ message cards
+    def _show_messages(self, d=None):
+        if d:
+            self._check_d = d
+        for c in list(self.msg_list.children):
+            self.msg_list.remove(c)
+        if not self.inbox:
+            return
+        mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
+        entries = self.inbox.entries(mine)
+        if not entries:
+            self.msg_list.add(_label(
+                "No messages to %s yet.\nSign on SEND, then submit on RELAY." % (self._check_d or "D"),
+                size=15))
+            return
+        for e in entries[: self.shown]:
+            self.msg_list.add(self._message_card(e))
+        hidden = len(entries) - self.shown
+        if hidden > 0:
+            self.msg_list.add(_button("Show %d more (%d hidden)" % (min(PAGE, hidden), hidden),
+                                      self._show_more, primary=False))
+
+    def _show_more(self, widget, **kwargs):
+        self.shown += PAGE
+        self._show_messages()
+
+    def _message_card(self, e: dict):
+        """One message: text, signer, block/time, tx link button and a small reply button."""
+        def lab(text, size=13, bold=False, muted=True):
+            extra = {"font_weight": "bold"} if bold else {}
+            return toga.Label(text, style=_pack(pad=(2, 12, 2, 12), color=MUTED if muted else TXT,
+                                                background_color=PANEL, font_size=size, **extra))
+
+        def small(text, handler, primary):
+            return toga.Button(text, on_press=handler, style=_pack(
+                pad=(6, 6, 8, 6), color=TXT, background_color=GREEN if primary else GREY,
+                font_size=14, font_weight="bold", height=42, flex=1))
+
+        kids = []
+        if e["reply_to"]:
+            kids.append(lab("↩ reply to #%s" % e["reply_to"], 13, True))
+        kids.append(lab(e["text"] or "(empty)", 17, True, muted=False))
+        kids.append(lab(e["who"], 12))
+        meta = e["status"] if e["pending"] else "block %s · %s · TRUST Received 1 SOS" % (e["block"], e["when"])
+        kids.append(lab(meta, 12))
+        buttons = []
+        if e["tx"]:
+            tx = e["tx"]
+            buttons.append(small("TX ↗ %s…%s" % (tx[:8], tx[-4:]), self._link_handler(tx), False))
+        buttons.append(small("↩ #%s" % e["code"], self._reply_handler(e["code"]), True))
+        kids.append(toga.Box(style=_pack(direction=ROW, background_color=PANEL), children=buttons))
+        return toga.Box(style=_pack(direction=COLUMN, background_color=PANEL,
+                                    pad=(8, SIDE, 4, SIDE)), children=kids)
+
+    def _link_handler(self, tx: str):
+        def handler(widget, **kwargs):
+            url = "https://etherscan.io/tx/" + tx
+            if self._open_url(url):
+                self.check_status.text = "Opening Etherscan…"
+            else:
+                self.check_status.text = ("Link copied ✔ (could not open the browser): " + url
+                                          if self._copy(url) else "Could not open " + url)
+        return handler
+
+    def _reply_handler(self, code: str):
+        def handler(widget, **kwargs):
+            self.reply_code_in.value = "#" + code
+            self.send_status.text = "Replying to #%s. Type your message and press Sign." % code
+            self.main_window.content = self.pages["SEND"]
+            try:
+                self.msg_in.focus()
+            except Exception:
+                pass
+        return handler
+
+    def _open_url(self, url: str) -> bool:
+        try:  # Android: hand the link to the browser
+            from java import jclass
+            Intent, Uri = jclass("android.content.Intent"), jclass("android.net.Uri")
+            self._impl.native.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            return True
+        except Exception:
+            pass
+        try:  # desktop
+            import webbrowser
+            return bool(webbrowser.open(url))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ SEND
     def sign_message(self, widget, **kwargs):
@@ -540,9 +643,7 @@ class SOS69069MsgApp(toga.App):
             self.relay_in.value = record
             if self.inbox:
                 self.inbox.add_pending(_hex(ph), meta)
-                self.messages_out.value = self.inbox.render(
-                    self.conv.rendezvous_d,
-                    self.mgr.factory.my_signer_addresses())
+                self._show_messages()
             code = short_code(_hex(ph))
             self.send_status.text = f"Signed ✔  #{code}  — open RELAY and Submit"
             self.msg_in.value = ""
@@ -588,9 +689,7 @@ class SOS69069MsgApp(toga.App):
                 ph = "0x" + ph
             if self.inbox and ph:
                 self.inbox.mark_submitted(ph, tx)
-                self.messages_out.value = self.inbox.render(
-                    self.conv.rendezvous_d if self.conv else "",
-                    self.mgr.factory.my_signer_addresses() if self.mgr else ())
+                self._show_messages()
         except Exception as e:
             self.relay_status.text = f"Error: {type(e).__name__}: {e}"
 

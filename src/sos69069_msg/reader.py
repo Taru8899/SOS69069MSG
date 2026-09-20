@@ -7,6 +7,7 @@ Pending (signed but not yet submitted) messages appear at the top.
 
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -58,6 +59,24 @@ class Message:
             f"TRUST Received 1 SOS ·  #{code}\n"
             f"REPLY (start conv {reply_id})"
         )
+
+
+_REPLY = re.compile(r"^#([0-9A-Fa-f]{4})\s+(.*)$", re.S)
+
+
+def split_reply(text: str) -> Tuple[str, str]:
+    """'#A3F2 hello' -> ('A3F2', 'hello'); anything else -> ('', text)."""
+    m = _REPLY.match(text or "")
+    return (m.group(1).upper(), m.group(2)) if m else ("", text or "")
+
+
+def _fmt(ts: int) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m/%Y, %H:%M:%S")
+
+
+def _0x(h: str) -> str:
+    h = str(h or "")
+    return h if h.startswith("0x") or not h else "0x" + h
 
 
 def _addr_from_topic(topic: str) -> str:
@@ -200,6 +219,33 @@ class Inbox:
             op = o["ph"] if str(o["ph"]).startswith("0x") else ("0x" + str(o["ph"]))
             if op.lower() not in on_chain and not o.get("tx"):
                 out.append(o)
+        return out
+
+    def waiting(self) -> List[dict]:
+        """My signed messages that are not on chain yet (not submitted, or submitted and unmined)."""
+        on_chain = {m.payload_hash.lower() for m in self.messages}
+        return [o for o in self.outbox if _0x(o["ph"]).lower() not in on_chain]
+
+    def entries(self, mine=()) -> List[dict]:
+        """Everything for the CHECK list, newest first (waiting messages on top).
+
+        Each entry: pending, status, text, reply_to, who, tx, block, when, code
+        """
+        out: List[dict] = []
+        for o in reversed(self.waiting()):
+            reply_to, body = split_reply(o["text"])
+            out.append({"pending": True,
+                        "status": ("⏳ Submitted, waiting to be mined" if o.get("tx")
+                                   else "⏳ NOT submitted yet (open RELAY)"),
+                        "text": body, "reply_to": reply_to, "who": "you",
+                        "tx": _0x(o.get("tx", "")), "block": None, "when": _fmt(o["ts"]),
+                        "code": short_code(o["ph"])})
+        for m in reversed(self.messages):
+            reply_to, body = split_reply(m.text)
+            out.append({"pending": False, "status": "", "text": body, "reply_to": reply_to,
+                        "who": "you" if m.signer in mine else m.signer,
+                        "tx": _0x(m.tx_hash), "block": m.block, "when": _fmt(m.timestamp),
+                        "code": short_code(m.payload_hash) if m.payload_hash else "----"})
         return out
 
     def render(self, d: str = "", mine=()) -> str:

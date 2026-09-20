@@ -13,3 +13,7 @@ CHAIN_ID = 1
 
 # Hard limit from the contract (bytes of the UTF-8 metadata string)
 MAX_METADATA_LENGTH = 64
+
+# Pre-inserted Etherscan API key used by the CHECK page. Users can paste their own key in
+# SETUP -> Network if this one stops working (their key is then tried first).
+DEFAULT_ETHERSCAN_KEY = "RU99NEJZV9F2EWS7A97RWVHDJN1ZQ29Q99"
