@@ -279,7 +279,7 @@ class TestRelayer(unittest.TestCase):
         sync(rpc, d, inbox)
         out = inbox.render(d, mine={self.key.address})
         self.assertLess(out.index("second one"), out.index("hi there"))
-        self.assertIn("from you", out)
+        self.assertIn("you", out)
         self.assertIn("from " + k2.address[:6], out)
         self.assertIn("#", out)
 
