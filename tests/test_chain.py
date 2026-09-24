@@ -7,14 +7,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from sos69069_msg import rlp
 from sos69069_msg.abi import (RECORD_SIGNATURE_SELECTOR, SIGNATURE_RECORDED_TOPIC,
                               decode_signature_recorded, encode_record_signature)
-from sos69069_msg.address_factory import AddressFactory, generate_seed
 from sos69069_msg.config import CONTRACT_ADDRESS, MAX_METADATA_LENGTH
-from sos69069_msg.conversation import ConversationManager
 from sos69069_msg.eip712 import verify_record
 from sos69069_msg.ethcrypto import (KeyPair, keccak256, normalize_address, parse_address,
                                     recover_address)
 from sos69069_msg.message_engine import prepare_and_sign, short_code
-from sos69069_msg.reader import Inbox, scan, sync
 from sos69069_msg.relayer import parse_record, submit
 from sos69069_msg.rpc import RpcError, _check_url
 from sos69069_msg.submission import build_record_signature_call
