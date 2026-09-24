@@ -1,4 +1,8 @@
-"""Plain public messages only — metadata carries the raw ≤64-char text."""
+"""Plain public self-posts — metadata = raw ≤64-char text.
+
+Signer always posts intendedTo = their own address so on-chain there is
+no link between conversation partners.
+"""
 
 from typing import Tuple
 
@@ -10,20 +14,17 @@ from .ethcrypto import KeyPair
 
 def prepare_and_sign(
     key: KeyPair,
-    intended_to: str,          # D
     plaintext: str,
     reply_code: str = "",
 ) -> Tuple[bytes, str, bytes]:
     """
+    Sign a self-post: intendedTo = key.address.
     Returns (payload_hash, metadata, signature).
-    metadata = optional "#XXXX " prefix + plain text, total ≤ 64 characters.
-    No encryption.
     """
     text = plaintext.strip()
     code = (reply_code or "").strip().lstrip("#")
     if code:
-        prefix = f"#{code[:4].upper()} "
-        metadata = prefix + text
+        metadata = (f"#{code[:4].upper()} " + text)
     else:
         metadata = text
 
@@ -31,11 +32,11 @@ def prepare_and_sign(
         raise ValueError(f"Message limited to {MAX_METADATA_LENGTH} characters")
 
     payload_hash = random_payload_hash()
-    signature = sign_record(key, intended_to, payload_hash, metadata)
+    # Self-post: intendedTo == signer
+    signature = sign_record(key, key.address, payload_hash, metadata)
     return payload_hash, metadata, signature
 
 
 def short_code(payload_hash_hex: str) -> str:
-    """Visible short code shown next to every message (first 4 hex chars)."""
     h = payload_hash_hex.removeprefix("0x")
     return h[:4].upper()

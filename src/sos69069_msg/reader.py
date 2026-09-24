@@ -1,17 +1,18 @@
-"""Read EVERYTHING sent to address D from SignatureRecorded logs.
+"""Read self-posts for My and Other, merge chronologically.
 
-All metadata is plain public text.
-Message cards match sos69069.com density (body, signer, tx, block, time, TRUST, REPLY).
-Pending (signed but not yet submitted) messages appear at the top.
+On-chain each address only posts intendedTo = itself.
+The app (off-chain) knows the pair and merges both streams into one chat
+labeled Me / Other.
 """
+
+from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from .abi import SIGNATURE_RECORDED_TOPIC, decode_signature_recorded
 from .config import CONTRACT_ADDRESS
@@ -20,16 +21,19 @@ from .message_engine import short_code
 from .rpc import RpcClient, RpcError
 
 OVERLAP = 20
-DEFAULT_LOOKBACK = 1_000_000
+DEFAULT_LOOKBACK = 500_000
 MIN_CHUNK = 1_000
 _RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "max",
-                "results", "10000", "query returned", "more than", "smaller", "dataset", "window")
+                "results", "10000", "query returned", "more than")
 
 
-def short(addr: str) -> str:
-    if not addr or len(addr) < 10:
-        return addr or "?"
-    return f"{addr[:6]}…{addr[-4:]}"
+def _addr_from_topic(topic: str) -> str:
+    return normalize_address("0x" + topic[-40:])
+
+
+def _is_range_error(err: Exception) -> bool:
+    m = str(err).lower()
+    return any(h in m for h in _RANGE_HINTS)
 
 
 @dataclass
@@ -42,18 +46,22 @@ class Message:
     submitter: str
     text: str
     payload_hash: str = ""
+    intended_to: str = ""
 
-    def line(self, mine=()) -> str:
-        """Dense card matching sos69069.com."""
+    def line(self, my_address: str = "") -> str:
         t = datetime.fromtimestamp(self.timestamp, timezone.utc)
         when = t.strftime("%d/%m/%Y, %H:%M:%S")
-        who = "you" if self.signer in mine else self.signer
+        if my_address and self.signer.lower() == my_address.lower():
+            who = "Me"
+        else:
+            who = "Other"
         code = short_code(self.payload_hash) if self.payload_hash else "----"
         tx = self.tx_hash if str(self.tx_hash).startswith("0x") else ("0x" + str(self.tx_hash))
         reply_id = tx[2:10] if len(tx) >= 10 else code.lower()
         return (
             f"{self.text}\n"
             f"{who}\n"
+            f"{self.signer}\n"
             f"tx{tx}\n"
             f"· block {self.block} · {when}\n"
             f"TRUST Received 1 SOS ·  #{code}\n"
@@ -61,39 +69,16 @@ class Message:
         )
 
 
-_REPLY = re.compile(r"^#([0-9A-Fa-f]{4})\s+(.*)$", re.S)
-
-
-def split_reply(text: str) -> Tuple[str, str]:
-    """'#A3F2 hello' -> ('A3F2', 'hello'); anything else -> ('', text)."""
-    m = _REPLY.match(text or "")
-    return (m.group(1).upper(), m.group(2)) if m else ("", text or "")
-
-
-def _fmt(ts: int) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%d/%m/%Y, %H:%M:%S")
-
-
-def _0x(h: str) -> str:
-    h = str(h or "")
-    return h if h.startswith("0x") or not h else "0x" + h
-
-
-def _addr_from_topic(topic: str) -> str:
-    return normalize_address("0x" + topic[-40:])
-
-
-def _is_range_error(err: Exception) -> bool:
-    m = str(err).lower()
-    if "rate limit" in m or "api key" in m or "apikey" in m:   # not a range problem: don't shrink
-        return False
-    return any(h in m for h in _RANGE_HINTS)
-
-
-def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
-         chunk: Optional[int] = None,
-         progress: Optional[Callable[[str], None]] = None) -> List[Message]:
-    d_topic = "0x" + parse_address(d).rjust(32, b"\x00").hex()
+def scan_intended_to(
+    rpc,
+    intended_to: str,
+    from_block: int,
+    to_block: int,
+    chunk: Optional[int] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> List[Message]:
+    """All SignatureRecorded where intendedTo == intended_to (self-posts preferred)."""
+    d_topic = "0x" + parse_address(intended_to).rjust(32, b"\x00").hex()
     contract = normalize_address(CONTRACT_ADDRESS)
     topic0 = "0x" + SIGNATURE_RECORDED_TOPIC.hex()
     chunk = chunk or max(1, to_block - from_block + 1)
@@ -102,7 +87,7 @@ def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
     while start <= to_block:
         end = min(start + chunk - 1, to_block)
         if progress:
-            progress(f"Scanning blocks {start}–{end}…")
+            progress(f"Scanning {intended_to[:10]}… blocks {start}–{end}")
         try:
             logs = rpc.get_logs({
                 "address": contract,
@@ -115,8 +100,7 @@ def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
                 raise
             if chunk <= MIN_CHUNK:
                 raise RpcError(
-                    f"{e}. This RPC limits log queries; try another RPC URL "
-                    "or enter a later 'scan from block'."
+                    f"{e}. RPC/Etherscan range limit — set a later 'scan from block'."
                 ) from e
             chunk = max(MIN_CHUNK, chunk // 2)
             continue
@@ -127,18 +111,23 @@ def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
                 if isinstance(raw, str):
                     raw = bytes.fromhex(raw.removeprefix("0x"))
                 ph_b, _sig, ts, meta = decode_signature_recorded(raw)
+                # Etherscan may put timeStamp on the log
+                if not ts and log.get("timeStamp"):
+                    ts = int(str(log["timeStamp"]), 16) if str(log["timeStamp"]).startswith("0x") else int(log["timeStamp"])
                 topics = log.get("topics", [])
                 signer = _addr_from_topic(topics[1]) if len(topics) > 1 else ""
                 submitter = _addr_from_topic(topics[3]) if len(topics) > 3 else ""
+                # Prefer self-posts (signer == intendedTo); still keep others aimed at this addr
                 msgs.append(Message(
                     block=int(log.get("blockNumber", "0x0"), 16),
                     log_index=int(log.get("logIndex", "0x0"), 16),
                     tx_hash=log.get("transactionHash", ""),
-                    timestamp=ts,
+                    timestamp=ts or 0,
                     signer=signer,
                     submitter=submitter,
                     text=meta,
                     payload_hash="0x" + ph_b.hex(),
+                    intended_to=intended_to,
                 ))
             except Exception:
                 continue
@@ -148,17 +137,16 @@ def scan(rpc: RpcClient, d: str, from_block: int, to_block: int,
 
 @dataclass
 class Inbox:
-    VERSION = 2
+    """Cache for one local pair. Cleared when conversation ends."""
+    VERSION = 3
     path: str = ""
     last_block: Optional[int] = None
-    last_scan_from: Optional[int] = None
     messages: List[Message] = field(default_factory=list)
     outbox: List[dict] = field(default_factory=list)
 
     def __init__(self, path: str):
         self.path = path
         self.last_block = None
-        self.last_scan_from = None
         self.messages = []
         self.outbox = []
         if os.path.exists(path):
@@ -172,7 +160,7 @@ class Inbox:
             except Exception:
                 pass
 
-    def _save(self):
+    def _save(self) -> None:
         with open(self.path, "w") as f:
             json.dump({
                 "v": self.VERSION,
@@ -181,21 +169,31 @@ class Inbox:
                 "outbox": self.outbox,
             }, f)
 
+    def clear(self) -> None:
+        self.messages = []
+        self.outbox = []
+        self.last_block = None
+        try:
+            if os.path.exists(self.path):
+                os.unlink(self.path)
+        except OSError:
+            pass
+
     def merge(self, new_msgs: List[Message], latest_block: int) -> int:
-        existing = {(m.block, m.log_index) for m in self.messages}
+        existing = {(m.block, m.log_index, m.signer.lower()) for m in self.messages}
         added = 0
         for m in new_msgs:
-            key = (m.block, m.log_index)
+            key = (m.block, m.log_index, m.signer.lower())
             if key not in existing:
                 self.messages.append(m)
                 existing.add(key)
                 added += 1
-        self.messages.sort(key=lambda m: (m.block, m.log_index))
+        self.messages.sort(key=lambda m: (m.block, m.log_index, m.timestamp))
         self.last_block = latest_block
         self._save()
         return added
 
-    def add_pending(self, payload_hash_hex: str, text: str):
+    def add_pending(self, payload_hash_hex: str, text: str) -> None:
         self.outbox.append({
             "ph": payload_hash_hex,
             "text": text,
@@ -204,7 +202,7 @@ class Inbox:
         })
         self._save()
 
-    def mark_submitted(self, payload_hash_hex: str, tx: str):
+    def mark_submitted(self, payload_hash_hex: str, tx: str) -> None:
         ph = payload_hash_hex if str(payload_hash_hex).startswith("0x") else ("0x" + str(payload_hash_hex))
         for o in self.outbox:
             op = o["ph"] if str(o["ph"]).startswith("0x") else ("0x" + str(o["ph"]))
@@ -221,55 +219,36 @@ class Inbox:
                 out.append(o)
         return out
 
-    def waiting(self) -> List[dict]:
-        """My signed messages that are not on chain yet (not submitted, or submitted and unmined)."""
-        on_chain = {m.payload_hash.lower() for m in self.messages}
-        return [o for o in self.outbox if _0x(o["ph"]).lower() not in on_chain]
-
-    def entries(self, mine=()) -> List[dict]:
-        """Everything for the CHECK list, newest first (waiting messages on top).
-
-        Each entry: pending, status, text, reply_to, who, tx, block, when, code
-        """
-        out: List[dict] = []
-        for o in reversed(self.waiting()):
-            reply_to, body = split_reply(o["text"])
-            out.append({"pending": True,
-                        "status": ("⏳ Submitted, waiting to be mined" if o.get("tx")
-                                   else "⏳ NOT submitted yet (open RELAY)"),
-                        "text": body, "reply_to": reply_to, "who": "you",
-                        "tx": _0x(o.get("tx", "")), "block": None, "when": _fmt(o["ts"]),
-                        "code": short_code(o["ph"])})
-        for m in reversed(self.messages):
-            reply_to, body = split_reply(m.text)
-            out.append({"pending": False, "status": "", "text": body, "reply_to": reply_to,
-                        "who": "you" if m.signer in mine else m.signer,
-                        "tx": _0x(m.tx_hash), "block": m.block, "when": _fmt(m.timestamp),
-                        "code": short_code(m.payload_hash) if m.payload_hash else "----"})
-        return out
-
-    def render(self, d: str = "", mine=()) -> str:
+    def render(self, my_address: str = "") -> str:
         lines = []
         for o in reversed(self.pending()):
             code = short_code(o["ph"])
             lines.append(
                 f"{o['text']}\n"
+                f"Me\n"
                 f"⏳ NOT submitted yet\n"
-                f"#{code}\n"
-                f"REPLY (start conv {code.lower()})"
+                f"#{code}"
             )
         for m in reversed(self.messages):
-            lines.append(m.line(mine))
+            lines.append(m.line(my_address))
         if not lines:
             return (
-                f"No messages to {d or 'D'} yet.\n\n"
-                f"Sign on SEND, then submit on RELAY."
+                "No messages yet.\n\n"
+                "Each side posts to their own address.\n"
+                "Sign on SEND, submit on RELAY, then CHECK."
             )
         return "\n\n────────────────────\n\n".join(lines)
 
 
-def sync(rpc: RpcClient, d: str, inbox: Inbox, from_block: Optional[int] = None,
-         progress: Optional[Callable[[str], None]] = None) -> int:
+def sync_pair(
+    rpc,
+    my_address: str,
+    other_address: str,
+    inbox: Inbox,
+    from_block: Optional[int] = None,
+    progress: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Fetch self-posts for My and Other, merge by chronology."""
     latest = rpc.block_number()
     if from_block is not None:
         start = from_block
@@ -277,6 +256,15 @@ def sync(rpc: RpcClient, d: str, inbox: Inbox, from_block: Optional[int] = None,
         start = max(0, inbox.last_block + 1 - OVERLAP)
     else:
         start = max(0, latest - DEFAULT_LOOKBACK)
-    msgs = scan(rpc, d, start, latest, progress=progress)
-    inbox.last_scan_from = start
-    return inbox.merge(msgs, latest)
+
+    a = normalize_address(my_address)
+    b = normalize_address(other_address)
+    msgs_a = scan_intended_to(rpc, a, start, latest, progress=progress)
+    msgs_b = scan_intended_to(rpc, b, start, latest, progress=progress)
+    # Keep only self-posts for a clean pair view (signer == intendedTo)
+    def self_only(ms: List[Message], addr: str) -> List[Message]:
+        al = addr.lower()
+        return [m for m in ms if m.signer.lower() == al]
+
+    merged = self_only(msgs_a, a) + self_only(msgs_b, b)
+    return inbox.merge(merged, latest)

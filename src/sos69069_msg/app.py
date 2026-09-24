@@ -1,11 +1,10 @@
 """
 SOS69069 MSG — CHECK · SEND · RELAY · SETUP
 
-Style aligned with sos69069.com / cSOS:
-- dark background, green primary buttons
-- massive nav tabs
-- larger bold text, consistent side padding (nothing off-screen)
-- rich message cards
+Protocol:
+  Each user posts intendedTo = their own address (self-post).
+  Locally the app pairs My + Other and merges both streams as one chat.
+  Ending the conversation deletes the local A↔B link — clean page.
 """
 
 import asyncio
@@ -21,16 +20,16 @@ from toga.style.pack import COLUMN, ROW
 
 from .address_factory import AddressFactory, generate_seed
 from .config import CHAIN_ID, CONTRACT_ADDRESS, DEFAULT_ETHERSCAN_KEY, MAX_METADATA_LENGTH
-from .conversation import ConversationManager
+from .conversation import Conversation, ConversationStore, random_wallet, start_pair
 from .eip712 import verify_record
+from .etherscan import EtherscanClient
 from .logo import logo_bytes
 from .message_engine import prepare_and_sign, short_code
-from .reader import Inbox, sync
+from .reader import Inbox, sync_pair
 from .relayer import parse_record, submit
-from .etherscan import EtherscanClient
-from .rpc import RpcClient
+from .rpc import RpcClient, RpcError
 from .submission import build_record_signature_call
-from .ethcrypto import KeyPair
+from .ethcrypto import KeyPair, normalize_address
 
 APP_NAME = "SOS69069 MSG"
 DEFAULT_RPC = "https://ethereum-rpc.publicnode.com"
@@ -45,8 +44,7 @@ TAB = "#3A4540"
 TAB_ACTIVE = "#05AA34"
 TXT = "#FFFFFF"
 MUTED = "#A8B5B0"
-PAGE = 10           # message cards shown at first (and per 'Show more')
-SIDE = 18          # horizontal padding — keeps text on screen
+SIDE = 18
 
 
 def _pack(pad=None, **kw):
@@ -145,28 +143,31 @@ class SOS69069MsgApp(toga.App):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.seed_file = self.data_dir / "seed.hex"
         self.settings_file = self.data_dir / "settings.json"
-        self.mgr = self.conv = self.inbox = self.relayer = None
+        self.pair_store = ConversationStore(self.data_dir / "pair.json")
+        self.inbox_path = self.data_dir / "inbox_pair.json"
+        self.conv = None
+        self.inbox = Inbox(str(self.inbox_path))
+        self.relayer = None
         self.last_tx_link = ""
         self._refreshing = False
         self._refresh_started = 0.0
         self.settings = self._load_settings()
-        self._load_seed()
+        self._load_relayer_seed()
+        self.conv = self.pair_store.load()
 
         # ---------- CHECK ----------
-        self.d_in = _input(placeholder="D address (0x…)")
+        self.pair_status = _label("", muted=False, size=14, bold=True)
         self.check_status = _label("", muted=False, size=15, bold=True)
-        self.msg_list = _col([])          # message cards go here
-        self.shown = PAGE                 # how many cards are visible
-        self._check_d = ""
+        self.messages_out = _panel(400)
         self.from_in = _input(placeholder="Scan from block (optional)")
         check = _col([
             _title("CHECK"),
-            _label("Enter any D address and press CHECK.", size=14),
-            self.d_in,
+            _label("Merged chat: your self-posts + peer self-posts (local pair only).", size=13),
+            self.pair_status,
             _button("CHECK", self.do_check),
             self.check_status,
             _label("Messages", muted=False, size=17, bold=True, pad=(16, SIDE, 6, SIDE)),
-            self.msg_list,
+            self.messages_out,
             _button("Send", self.goto_send, primary=False),
             self.from_in,
         ])
@@ -178,7 +179,7 @@ class SOS69069MsgApp(toga.App):
         self.signed_out = _panel(220)
         send = _col([
             _title("SEND"),
-            _label("Plain public text only. Max 64 characters.", size=14),
+            _label("Signed as you → intendedTo = your address (self-post). Max 64 chars.", size=13),
             self.msg_in,
             _label("Optional short code of the message you answer", size=14),
             self.reply_code_in,
@@ -200,7 +201,7 @@ class SOS69069MsgApp(toga.App):
         self.relay_status = _label("", muted=False, size=15, bold=True)
         relay = _col([
             _title("RELAY"),
-            _label("Paste a 64-hex PRIVATE KEY to pay gas from that wallet. An address alone still uses the seed-derived key.", size=13),
+            _label("Paste a 64-hex PRIVATE KEY to pay gas, or leave the default relayer.", size=13),
             self.relayer_in,
             self.relayer_note,
             _button("Check balance", self.check_balance, primary=False),
@@ -214,41 +215,37 @@ class SOS69069MsgApp(toga.App):
         ])
 
         # ---------- SETUP ----------
-        self.seed_status = _label("", muted=False, size=15, bold=True)
-        self.seed_out = _panel(80, "Seed (auto-created). Back it up if you want.")
-        self.seed_in = _input(placeholder="Paste 64-hex seed to import")
-        self.conv_out = _panel(130)
+        self.my_out = _panel(90, "My conversation wallet appears here.")
+        self.other_in = _input(placeholder="Other address (0x…)")
+        self.conv_out = _panel(120)
+        self.copy_status = _label("", muted=False, size=14)
         self.rpc_in = _input(value=self.settings["rpc_url"])
-        self.es_in = _input(value=self.settings.get("etherscan_key") or DEFAULT_ETHERSCAN_KEY,
-                            placeholder="Etherscan API key (for CHECK)")
+        self.es_in = _input(value=self.settings.get("etherscan_key", DEFAULT_ETHERSCAN_KEY))
         self.cap_in = _input(value=str(self.settings["max_fee_gwei"]))
         self.net_status = _label("", muted=False, size=15, bold=True)
-        self.copy_status = _label("", muted=False, size=14)
         setup = _col([
             _title("SETUP"),
-            _label("Identity is created automatically so you can sign.", size=14),
-            self.seed_status,
-            self.seed_out,
-            _button("Copy seed", self._copier(
-                lambda: self.seed_out.value or (
-                    self.seed_file.read_text() if self.seed_file.exists() else ""),
-                "seed", self.copy_status), primary=False),
-            self.copy_status,
-            self.seed_in,
-            _button("Import seed", self.import_seed, primary=False),
-            _title("Conversation"),
-            _button("New Conversation", self.start_new_conversation),
-            self.conv_out,
-            _button("Copy current D", self._copier(
-                lambda: self.conv.rendezvous_d if self.conv else "", "D", self.copy_status),
+            _label(
+                "Generate your wallet, paste the other person's address, start.\n"
+                "On-chain you only post to yourself. The pair is local only.",
+                size=13,
+            ),
+            _label("1. My conversation wallet", muted=False, size=16, bold=True),
+            _button("Generate my wallet", self.gen_my_wallet),
+            self.my_out,
+            _button("Copy my address", self._copier(
+                lambda: self.conv.my_address if self.conv else "", "my address", self.copy_status),
                 primary=False),
+            self.copy_status,
+            _label("2. Other address (from the other person)", muted=False, size=16, bold=True),
+            self.other_in,
+            _button("Start conversation", self.start_conversation),
+            self.conv_out,
+            _button("End conversation (wipe local pair)", self.end_conversation, primary=False),
             _title("Network"),
-            _label("Etherscan API key (pre-filled). CHECK reads messages through Etherscan. "
-                   "If it stops working, paste your own key here and Save.", size=14),
+            _label("Etherscan API key (CHECK). Paste your own if needed.", size=13),
             self.es_in,
-            _button("Reset to default key", self.reset_key, primary=False),
-            _label("RPC URL: used for SEND / RELAY (sending transactions) and as CHECK's fallback.",
-                   size=14),
+            _label("RPC URL (SEND / RELAY)", size=13),
             self.rpc_in,
             _label("Max gas fee (gwei)", size=14),
             self.cap_in,
@@ -265,14 +262,15 @@ class SOS69069MsgApp(toga.App):
             self.pages[name] = _col([self._header(name, list(bodies)), scroller], flex=1)
 
         self.main_window = toga.MainWindow(title=self.formal_name)
-        self.main_window.content = self.pages["CHECK"]
+        self.main_window.content = self.pages["SETUP"] if not self.conv else self.pages["CHECK"]
         self.main_window.show()
         self._hide_title_bar()
-        self._refresh_seed_status()
-        if self.mgr and not self.conv:
-            self.start_new_conversation(None)
+        self._refresh_pair_ui()
+        if self.relayer:
+            self.relayer_in.value = self.relayer.address
+            self.relayer_note.text = "Default relayer (seed-derived). Paste any private key to override."
 
-    # ------------------------------------------------------------------ header / nav
+    # ------------------------------------------------------------------ header
     def _header(self, active: str, names: list):
         def make_tab(n):
             def go(widget, **kw):
@@ -280,15 +278,8 @@ class SOS69069MsgApp(toga.App):
             color = TAB_ACTIVE if n == active else TAB
             return toga.Button(
                 n, on_press=go,
-                style=_pack(
-                    pad=(14, 4, 14, 4),
-                    color=TXT,
-                    background_color=color,
-                    font_size=16,
-                    font_weight="bold",
-                    flex=1,
-                    height=54,
-                ),
+                style=_pack(pad=(14, 4, 14, 4), color=TXT, background_color=color,
+                            font_size=16, font_weight="bold", flex=1, height=54),
             )
         try:
             logo = toga.ImageView(
@@ -348,16 +339,18 @@ class SOS69069MsgApp(toga.App):
             status.text = f"Copied {what} ✔" if self._copy(t) else f"Could not copy {what}"
         return handler
 
-    # ------------------------------------------------------------------ settings / seed
+    # ------------------------------------------------------------------ settings / relayer seed
     def _load_settings(self):
-        s = {"rpc_url": DEFAULT_RPC, "max_fee_gwei": DEFAULT_MAX_FEE_GWEI, "etherscan_key": DEFAULT_ETHERSCAN_KEY}
+        s = {
+            "rpc_url": DEFAULT_RPC,
+            "max_fee_gwei": DEFAULT_MAX_FEE_GWEI,
+            "etherscan_key": DEFAULT_ETHERSCAN_KEY,
+        }
         if self.settings_file.exists():
             try:
                 s.update(json.loads(self.settings_file.read_text()))
             except Exception:
                 pass
-        if not (s.get("etherscan_key") or "").strip():
-            s["etherscan_key"] = DEFAULT_ETHERSCAN_KEY
         return s
 
     def _save_settings(self):
@@ -369,271 +362,192 @@ class SOS69069MsgApp(toga.App):
             cap = float(self.cap_in.value)
             if cap <= 0:
                 raise ValueError("cap must be > 0")
-            self.settings.update({"rpc_url": self.rpc_in.value.strip(), "max_fee_gwei": cap,
-                                  "etherscan_key": self.es_in.value.strip() or DEFAULT_ETHERSCAN_KEY})
-            self.es_in.value = self.settings["etherscan_key"]
+            self.settings["rpc_url"] = self.rpc_in.value.strip()
+            self.settings["max_fee_gwei"] = cap
+            self.settings["etherscan_key"] = (self.es_in.value or "").strip() or DEFAULT_ETHERSCAN_KEY
             self._save_settings()
             self.net_status.text = "Saved ✔"
         except Exception as e:
             self.net_status.text = f"Error: {e}"
 
-    def _rpc(self) -> RpcClient:
+    def _rpc(self):
         return RpcClient(self.settings["rpc_url"])
 
-    def reset_key(self, widget, **kwargs):
-        self.settings["etherscan_key"] = DEFAULT_ETHERSCAN_KEY
-        self.es_in.value = DEFAULT_ETHERSCAN_KEY
-        self._save_settings()
-        self.net_status.text = "Default Etherscan key restored ✔"
-
-    def _check_sources(self):
-        """Backends for CHECK, best first: Etherscan (if a key is set), then the RPC."""
-        out = []
-        mine = (self.settings.get("etherscan_key") or "").strip()
-        for key in [k for k in dict.fromkeys([mine, DEFAULT_ETHERSCAN_KEY]) if k]:   # yours first
-            label = "Etherscan" if key == mine else "Etherscan (default key)"
-            out.append((label, lambda key=key: EtherscanClient(key, CHAIN_ID)))
-        out.append(("RPC", self._rpc))
-        return out
-
-    def _load_seed(self):
-        if self.seed_file.exists():
-            self._set_seed(_from_hex(self.seed_file.read_text()), save=False)
-        else:
-            self._set_seed(generate_seed(), save=True)
-
-    def _set_seed(self, seed: bytes, save: bool = True):
-        if len(seed) != 32:
-            raise ValueError("Seed must be 32 bytes (64 hex characters)")
-        if save:
-            self.seed_file.write_text(seed.hex())
+    def _check_backends(self):
+        """Etherscan first (if key set), then RPC fallback."""
+        backends = []
+        key = (self.settings.get("etherscan_key") or "").strip()
+        if key:
             try:
-                os.chmod(self.seed_file, 0o600)
-            except OSError:
+                backends.append(("etherscan", EtherscanClient(key, CHAIN_ID)))
+            except Exception:
                 pass
+        backends.append(("rpc", self._rpc()))
+        return backends
+
+    def _load_relayer_seed(self):
+        """Optional seed only for a default gas-paying relayer key."""
+        if not self.seed_file.exists():
+            seed = generate_seed()
+            self.seed_file.write_text(seed.hex())
+        else:
+            seed = _from_hex(self.seed_file.read_text())
         factory = AddressFactory(seed, str(self.data_dir / "signer_counter.json"))
-        self.mgr = ConversationManager(factory)
         self.relayer = factory.relayer_key(0)
-        self.conv = self.inbox = None
 
-    def _refresh_seed_status(self):
-        self.seed_status.text = "Identity ready ✔ (auto)" if self.mgr else "No identity"
-        if self.seed_file.exists():
-            self.seed_out.value = self.seed_file.read_text()
-        if self.relayer:
-            self.relayer_in.value = self.relayer.address
-            self.relayer_note.text = "Default relayer. Paste any private key to override."
-
-    def import_seed(self, widget, **kwargs):
-        try:
-            self._set_seed(_from_hex(self.seed_in.value))
-            self.seed_in.value = ""
-            self._refresh_seed_status()
-            self.start_new_conversation(None)
-        except Exception as e:
-            self.seed_status.text = f"Error: {e}"
-
-    # ------------------------------------------------------------------ conversation / D
-    def start_new_conversation(self, widget, **kwargs):
-        try:
-            if not self.mgr:
-                raise ValueError("Identity missing")
-            self.conv = self.mgr.start_conversation()
-            self.inbox = Inbox(str(self.data_dir / f"inbox_{self.conv.rendezvous_d[2:10]}.json"))
-            self.d_in.value = self.conv.rendezvous_d
-            self.shown = PAGE
-            self._show_messages(self.conv.rendezvous_d)
+    def _refresh_pair_ui(self):
+        if self.conv:
+            self.my_out.value = (
+                f"My address:\n{self.conv.my_address}\n\n"
+                f"(private key stays on this device)"
+            )
+            self.other_in.value = self.conv.other_address
+            self.pair_status.text = (
+                f"My: {self.conv.my_address[:10]}…\n"
+                f"Other: {self.conv.other_address[:10]}…"
+            )
             self.conv_out.value = (
-                f"New D ready:\n{self.conv.rendezvous_d}\n\n"
-                f"Share this address with the other person.\n"
+                f"Active pair (local only)\n\n"
+                f"My:    {self.conv.my_address}\n"
+                f"Other: {self.conv.other_address}\n\n"
+                f"On-chain each posts only to themselves.\n"
                 f"Contract: {CONTRACT_ADDRESS}"
             )
-            if self.relayer:
-                self.relayer_in.value = self.relayer.address
-            self.check_status.text = "New conversation started ✔"
+            self.messages_out.value = self.inbox.render(self.conv.my_address)
+        else:
+            self.my_out.value = "No wallet yet — tap Generate my wallet."
+            self.other_in.value = ""
+            self.pair_status.text = "No active conversation — open SETUP."
+            self.conv_out.value = "Clean page. Generate wallet, paste Other, Start."
+            self.messages_out.value = ""
+
+    # ------------------------------------------------------------------ conversation lifecycle
+    def gen_my_wallet(self, widget, **kwargs):
+        try:
+            other = (self.other_in.value or "").strip()
+            # Generate only; Other may be filled later
+            kp = random_wallet()
+            if other:
+                self.conv = start_pair(kp, other)
+                self.pair_store.save(self.conv)
+            else:
+                # Temporary: hold key until Other is set
+                self.conv = Conversation(kp, "0x" + "00" * 20)
+                self.pair_store.clear()  # not a real pair yet
+            self._refresh_pair_ui()
+            self.conv_out.value = (
+                f"My wallet ready:\n{kp.address}\n\n"
+                f"Share this address with the other person.\n"
+                f"Then paste their address below and tap Start conversation."
+            )
         except Exception as e:
             self.conv_out.value = f"Error: {e}"
 
+    def start_conversation(self, widget, **kwargs):
+        try:
+            other = (self.other_in.value or "").strip()
+            if not other:
+                raise ValueError("Paste the other person's address")
+            if self.conv and self.conv.other != "0x" + "00" * 20:
+                my = self.conv.my
+            elif self.conv:
+                my = self.conv.my
+            else:
+                my = random_wallet()
+            self.conv = start_pair(my, other)
+            self.pair_store.save(self.conv)
+            self.inbox = Inbox(str(self.inbox_path))
+            self._refresh_pair_ui()
+            self.conv_out.value = (
+                f"Conversation started (local pair only).\n\n"
+                f"My:    {self.conv.my_address}\n"
+                f"Other: {self.conv.other_address}\n\n"
+                f"Open CHECK to load the merged timeline."
+            )
+            self.main_window.content = self.pages["CHECK"]
+        except Exception as e:
+            self.conv_out.value = f"Error: {e}"
+
+    def end_conversation(self, widget, **kwargs):
+        """Wipe local A↔B link and inbox — clean page for the next chat."""
+        self.pair_store.clear()
+        if self.inbox:
+            self.inbox.clear()
+        self.conv = None
+        self.inbox = Inbox(str(self.inbox_path))
+        self._refresh_pair_ui()
+        self.conv_out.value = (
+            "Conversation ended.\n"
+            "Local pair and message cache wiped.\n"
+            "Generate a new wallet to start clean."
+        )
+        self.check_status.text = "No active conversation"
+        self.messages_out.value = ""
+
     # ------------------------------------------------------------------ CHECK
     async def do_check(self, widget, **kwargs):
-        """Paste any address -> show SignatureRecorded where intendedTo == that address."""
-        from .ethcrypto import normalize_address
-        raw = (self.d_in.value or "").strip()
-        if not raw:
-            self.check_status.text = "Enter a D address first"
+        if not self.conv or self.conv.other == "0x" + "00" * 20:
+            self.check_status.text = "Start a conversation first (SETUP)"
             return
-        try:
-            d = normalize_address(raw)
-            self.d_in.value = d
-        except Exception:
-            self.check_status.text = "Invalid address (need 0x + 40 hex characters)"
-            return
-
-        try:
-            if not self.mgr:
-                raise ValueError("Identity missing")
-            if not self.conv or self.conv.rendezvous_d.lower() != d.lower():
-                self.conv = self.mgr.start_conversation(d=d)
-            self.inbox = Inbox(str(self.data_dir / ("inbox_" + d[2:12].lower() + ".json")))
-        except Exception as e:
-            self.check_status.text = "Error: %s: %s" % (type(e).__name__, e)
-            return
-
         if self._refreshing and time.monotonic() - self._refresh_started < 90:
-            self.check_status.text = "Already scanning..."
+            self.check_status.text = "Already scanning…"
             return
         self._refreshing = True
         self._refresh_started = time.monotonic()
-        self.shown = PAGE
-        self.check_status.text = "Scanning messages to %s..." % d[:10]
+        self.check_status.text = "Scanning My + Other…"
         loop = asyncio.get_running_loop()
 
         def progress(msg):
             loop.call_soon_threadsafe(lambda: setattr(self.check_status, "text", msg))
 
+        last_err = None
         try:
-            if self.from_in.value.strip():
-                frm = int(self.from_in.value.strip())
-            else:
-                frm = None
-                # Force a full lookback every manual CHECK so pasting an address
-                # always re-reads recent history (not only last_block+1).
-                self.inbox.last_block = None
+            frm = int(self.from_in.value.strip()) if self.from_in.value.strip() else None
+            if frm is None:
+                self.inbox.last_block = None  # full lookback on manual CHECK
 
-            inbox = self.inbox
-            errors, used, new = [], None, 0
-            for name, make in self._check_sources():
+            my, other = self.conv.my_address, self.conv.other_address
+            for name, client in self._check_backends():
                 try:
-                    new = await asyncio.to_thread(sync, make(), d, inbox, frm, progress)
-                    used = name
-                    break
+                    new = await asyncio.to_thread(
+                        sync_pair, client, my, other, self.inbox, frm, progress)
+                    self.messages_out.value = self.inbox.render(my)
+                    total = len(self.inbox.messages) + len(self.inbox.pending())
+                    if total == 0:
+                        self.check_status.text = (
+                            f"0 messages · via {name} · block {self.inbox.last_block}\n"
+                            f"No self-posts yet for this pair."
+                        )
+                    else:
+                        self.check_status.text = (
+                            f"{new} new · {total} total · via {name} · block {self.inbox.last_block}"
+                        )
+                    return
                 except Exception as e:
-                    msg = str(e)
-                    errors.append(msg if msg.lower().startswith(name.lower()) else f"{name}: {msg}")
-            if used is None:
-                hint = "\nIf Etherscan reports an invalid key or rate limit, paste your own key in SETUP → Network."
-                raise RuntimeError(" | ".join(errors) + hint)
-            mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
-            self._show_messages(d)
-            total = len(inbox.messages) + len(inbox.pending())
-            if total == 0:
-                self.check_status.text = (
-                    "0 messages · block %s · via %s\nNo SignatureRecorded with intendedTo = this address yet."
-                ) % (inbox.last_block, used)
-            else:
-                self.check_status.text = "%s new · %s total · block %s · via %s" % (
-                    new, total, inbox.last_block, used)
+                    last_err = e
+                    continue
+            self.check_status.text = f"Error: {type(last_err).__name__}: {last_err}"
         except Exception as e:
-            self.check_status.text = "Error: %s: %s" % (type(e).__name__, e)
+            self.check_status.text = f"Error: {type(e).__name__}: {e}"
         finally:
             self._refreshing = False
-
-    # ------------------------------------------------------------------ message cards
-    def _show_messages(self, d=None):
-        if d:
-            self._check_d = d
-        for c in list(self.msg_list.children):
-            self.msg_list.remove(c)
-        if not self.inbox:
-            return
-        mine = self.mgr.factory.my_signer_addresses() if self.mgr else ()
-        entries = self.inbox.entries(mine)
-        if not entries:
-            self.msg_list.add(_label(
-                "No messages to %s yet.\nSign on SEND, then submit on RELAY." % (self._check_d or "D"),
-                size=15))
-            return
-        for e in entries[: self.shown]:
-            self.msg_list.add(self._message_card(e))
-        hidden = len(entries) - self.shown
-        if hidden > 0:
-            self.msg_list.add(_button("Show %d more (%d hidden)" % (min(PAGE, hidden), hidden),
-                                      self._show_more, primary=False))
-
-    def _show_more(self, widget, **kwargs):
-        self.shown += PAGE
-        self._show_messages()
-
-    def _message_card(self, e: dict):
-        """One message: text, signer, block/time, tx link button and a small reply button."""
-        def lab(text, size=13, bold=False, muted=True):
-            extra = {"font_weight": "bold"} if bold else {}
-            return toga.Label(text, style=_pack(pad=(2, 12, 2, 12), color=MUTED if muted else TXT,
-                                                background_color=PANEL, font_size=size, **extra))
-
-        def small(text, handler, primary):
-            return toga.Button(text, on_press=handler, style=_pack(
-                pad=(6, 6, 8, 6), color=TXT, background_color=GREEN if primary else GREY,
-                font_size=14, font_weight="bold", height=42, flex=1))
-
-        kids = []
-        if e["reply_to"]:
-            kids.append(lab("↩ reply to #%s" % e["reply_to"], 13, True))
-        kids.append(lab(e["text"] or "(empty)", 17, True, muted=False))
-        kids.append(lab(e["who"], 12))
-        meta = e["status"] if e["pending"] else "block %s · %s · TRUST Received 1 SOS" % (e["block"], e["when"])
-        kids.append(lab(meta, 12))
-        buttons = []
-        if e["tx"]:
-            tx = e["tx"]
-            buttons.append(small("TX ↗ %s…%s" % (tx[:8], tx[-4:]), self._link_handler(tx), False))
-        buttons.append(small("↩ #%s" % e["code"], self._reply_handler(e["code"]), True))
-        kids.append(toga.Box(style=_pack(direction=ROW, background_color=PANEL), children=buttons))
-        return toga.Box(style=_pack(direction=COLUMN, background_color=PANEL,
-                                    pad=(8, SIDE, 4, SIDE)), children=kids)
-
-    def _link_handler(self, tx: str):
-        def handler(widget, **kwargs):
-            url = "https://etherscan.io/tx/" + tx
-            if self._open_url(url):
-                self.check_status.text = "Opening Etherscan…"
-            else:
-                self.check_status.text = ("Link copied ✔ (could not open the browser): " + url
-                                          if self._copy(url) else "Could not open " + url)
-        return handler
-
-    def _reply_handler(self, code: str):
-        def handler(widget, **kwargs):
-            self.reply_code_in.value = "#" + code
-            self.send_status.text = "Replying to #%s. Type your message and press Sign." % code
-            self.main_window.content = self.pages["SEND"]
-            try:
-                self.msg_in.focus()
-            except Exception:
-                pass
-        return handler
-
-    def _open_url(self, url: str) -> bool:
-        try:  # Android: hand the link to the browser
-            from java import jclass
-            Intent, Uri = jclass("android.content.Intent"), jclass("android.net.Uri")
-            self._impl.native.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-            return True
-        except Exception:
-            pass
-        try:  # desktop
-            import webbrowser
-            return bool(webbrowser.open(url))
-        except Exception:
-            return False
 
     # ------------------------------------------------------------------ SEND
     def sign_message(self, widget, **kwargs):
         try:
-            if not self.conv:
+            if not self.conv or self.conv.other == "0x" + "00" * 20:
                 raise ValueError("Start a conversation first (SETUP)")
             text = (self.msg_in.value or "").strip()
             if not text:
                 raise ValueError("Type a message first")
-            key = self.mgr.next_signer(self.conv)
+            key = self.conv.my
             ph, meta, sig = prepare_and_sign(
-                key, self.conv.rendezvous_d, text,
-                reply_code=self.reply_code_in.value or "",
-            )
-            if not verify_record(key.address, self.conv.rendezvous_d, ph, meta, sig):
+                key, text, reply_code=self.reply_code_in.value or "")
+            # intendedTo is always My (self-post)
+            if not verify_record(key.address, key.address, ph, meta, sig):
                 raise RuntimeError("Local signature check failed")
             call = build_record_signature_call(
-                key.address, self.conv.rendezvous_d, ph, sig, meta)
+                key.address, key.address, ph, sig, meta)
             record = json.dumps({
                 "to": call["to"], "chainId": CHAIN_ID, "function": call["function"],
                 "signer": call["args"][0], "intendedTo": call["args"][1],
@@ -641,11 +555,10 @@ class SOS69069MsgApp(toga.App):
             }, indent=2)
             self.signed_out.value = record
             self.relay_in.value = record
-            if self.inbox:
-                self.inbox.add_pending(_hex(ph), meta)
-                self._show_messages()
+            self.inbox.add_pending(_hex(ph), meta)
+            self.messages_out.value = self.inbox.render(key.address)
             code = short_code(_hex(ph))
-            self.send_status.text = f"Signed ✔  #{code}  — open RELAY and Submit"
+            self.send_status.text = f"Signed ✔  #{code}  (self-post) — open RELAY and Submit"
             self.msg_in.value = ""
             self.reply_code_in.value = ""
         except Exception as e:
@@ -660,7 +573,7 @@ class SOS69069MsgApp(toga.App):
             except Exception as e:
                 raise ValueError(f"Invalid private key: {e}") from e
         if not self.relayer:
-            raise ValueError("No relayer — identity missing")
+            raise ValueError("No relayer")
         return self.relayer
 
     async def check_balance(self, widget, **kwargs):
@@ -681,15 +594,15 @@ class SOS69069MsgApp(toga.App):
             tx = await asyncio.to_thread(submit, rpc, relayer, rec, cap)
             self.last_tx_link = f"https://etherscan.io/tx/{tx}"
             self.relay_status.text = f"Sent ✔\n{self.last_tx_link}"
-            # parse_record uses payload_hash (bytes); normalize to 0x-hex
             ph = rec.get("payload_hash") or rec.get("payloadHash") or ""
             if isinstance(ph, bytes):
                 ph = "0x" + ph.hex()
             elif isinstance(ph, str) and ph and not ph.startswith("0x"):
                 ph = "0x" + ph
-            if self.inbox and ph:
+            if ph:
                 self.inbox.mark_submitted(ph, tx)
-                self._show_messages()
+                if self.conv:
+                    self.messages_out.value = self.inbox.render(self.conv.my_address)
         except Exception as e:
             self.relay_status.text = f"Error: {type(e).__name__}: {e}"
 
