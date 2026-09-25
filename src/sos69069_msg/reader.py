@@ -23,6 +23,8 @@ from .rpc import RpcClient, RpcError
 OVERLAP = 20
 DEFAULT_LOOKBACK = 500_000
 MIN_CHUNK = 1_000
+MAX_MESSAGES = 50
+PAGE_SIZE = 10
 _RANGE_HINTS = ("range", "limit", "exceed", "too many", "too large", "large", "max",
                 "results", "10000", "query returned", "more than")
 
@@ -189,6 +191,8 @@ class Inbox:
                 existing.add(key)
                 added += 1
         self.messages.sort(key=lambda m: (m.block, m.log_index, m.timestamp))
+        if len(self.messages) > MAX_MESSAGES:
+            self.messages = self.messages[-MAX_MESSAGES:]
         self.last_block = latest_block
         self._save()
         return added
@@ -238,6 +242,48 @@ class Inbox:
                 "Sign on SEND, submit on RELAY, then CHECK."
             )
         return "\n\n────────────────────\n\n".join(lines)
+
+    def entries(self, my_address: str = "") -> List[dict]:
+        """Structured, newest-first entries for card-style rendering + pagination.
+        Each entry: pending, text, who, address, tx, block, when, code, reply_id.
+        """
+        out: List[dict] = []
+        for o in reversed(self.pending()):
+            code = short_code(o["ph"])
+            out.append({
+                "pending": True,
+                "text": o["text"],
+                "who": "Me",
+                "address": my_address,
+                "tx": "",
+                "block": None,
+                "when": "",
+                "code": code,
+                "reply_id": code.lower(),
+            })
+        for m in reversed(self.messages):
+            t = datetime.fromtimestamp(m.timestamp, timezone.utc)
+            when = t.strftime("%d/%m/%Y, %H:%M:%S")
+            who = "Me" if my_address and m.signer.lower() == my_address.lower() else "Other"
+            code = short_code(m.payload_hash) if m.payload_hash else "----"
+            tx = m.tx_hash if str(m.tx_hash).startswith("0x") else ("0x" + str(m.tx_hash))
+            reply_id = tx[2:10] if len(tx) >= 10 else code.lower()
+            out.append({
+                "pending": False,
+                "text": m.text,
+                "who": who,
+                "address": m.signer,
+                "tx": tx,
+                "block": m.block,
+                "when": when,
+                "code": code,
+                "reply_id": reply_id,
+            })
+        return out
+
+    def page_count(self, my_address: str = "") -> int:
+        total = len(self.messages) + len(self.pending())
+        return max(1, -(-total // PAGE_SIZE))  # ceil div
 
 
 def sync_pair(

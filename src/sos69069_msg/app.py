@@ -81,6 +81,22 @@ def _label(text="", muted=True, size=15, bold=False, pad=(10, SIDE, 4, SIDE), al
         )
 
 
+def _clabel(text="", color=TXT, size=14, bold=False, align="left", pad=(2, SIDE, 2, SIDE), **kw):
+    extra = {"font_weight": "bold"} if bold else {}
+    try:
+        return toga.Label(
+            text, style=_pack(pad=pad, color=color, background_color=BG,
+                               font_size=size, text_align=align, **extra, **kw))
+    except Exception:
+        return toga.Label(
+            text, style=_pack(pad=pad, color=color, background_color=BG,
+                               font_size=size, **extra, **kw))
+
+
+GOLD = "#E8C547"
+BLUE = "#4FA3D1"
+
+
 def _title(text):
     return _label(text, muted=False, size=20, bold=True, pad=(20, SIDE, 8, SIDE))
 
@@ -149,6 +165,7 @@ class SOS69069MsgApp(toga.App):
         self.inbox = Inbox(str(self.inbox_path))
         self.relayer = None
         self.last_tx_link = ""
+        self._view_my = None
         self._refreshing = False
         self._refresh_started = 0.0
         self.settings = self._load_settings()
@@ -158,17 +175,40 @@ class SOS69069MsgApp(toga.App):
         # ---------- CHECK ----------
         self.pair_status = _label("", muted=False, size=14, bold=True)
         self.check_status = _label("", muted=False, size=15, bold=True)
-        self.messages_out = _panel(400)
+        self.check_my_in = _input(placeholder="My address (0x…)")
+        self.check_other_in = _input(placeholder="Other address (0x…)")
         self.from_in = _input(placeholder="Scan from block (optional)")
+        self.check_page = 1
+        self.cards_box = _col([])
+        self.page_label = _label("Page 1 / 1", muted=False, size=14, bold=True, align="center")
+        self.check_reply_in = _input(placeholder="Optional short code (#A3F2)")
+        self.check_msg_in = _input(placeholder=f"Message (≤{MAX_METADATA_LENGTH} characters)")
+        self.check_msg_in.on_change = self._on_check_msg_change
+        self.check_count_label = _label(f"0/{MAX_METADATA_LENGTH} characters", size=12)
+        self.check_send_status = _label("", muted=False, size=15, bold=True)
         check = _col([
             _title("CHECK"),
             _label("Merged chat: your self-posts + peer self-posts (local pair only).", size=13),
+            _label("My address", muted=False, size=14, bold=True, pad=(10, SIDE, 2, SIDE)),
+            self.check_my_in,
+            _label("Other address", muted=False, size=14, bold=True, pad=(6, SIDE, 2, SIDE)),
+            self.check_other_in,
             self.pair_status,
             _button("CHECK", self.do_check),
             self.check_status,
             _label("Messages", muted=False, size=17, bold=True, pad=(16, SIDE, 6, SIDE)),
-            self.messages_out,
-            _button("Send", self.goto_send, primary=False),
+            self.cards_box,
+            _row([
+                _button("◀ Prev", self.check_prev_page, primary=False),
+                self.page_label,
+                _button("Next ▶", self.check_next_page, primary=False),
+            ]),
+            _label("Reply / new message", muted=False, size=16, bold=True, pad=(18, SIDE, 6, SIDE)),
+            self.check_reply_in,
+            self.check_msg_in,
+            self.check_count_label,
+            _button("SEND", self.check_send),
+            self.check_send_status,
             self.from_in,
         ])
 
@@ -402,6 +442,8 @@ class SOS69069MsgApp(toga.App):
                 f"(private key stays on this device)"
             )
             self.other_in.value = self.conv.other_address
+            self.check_my_in.value = self.conv.my_address
+            self.check_other_in.value = self.conv.other_address
             self.pair_status.text = (
                 f"My: {self.conv.my_address[:10]}…\n"
                 f"Other: {self.conv.other_address[:10]}…"
@@ -413,13 +455,14 @@ class SOS69069MsgApp(toga.App):
                 f"On-chain each posts only to themselves.\n"
                 f"Contract: {CONTRACT_ADDRESS}"
             )
-            self.messages_out.value = self.inbox.render(self.conv.my_address)
         else:
             self.my_out.value = "No wallet yet — tap Generate my wallet."
             self.other_in.value = ""
+            self.check_my_in.value = ""
+            self.check_other_in.value = ""
             self.pair_status.text = "No active conversation — open SETUP."
             self.conv_out.value = "Clean page. Generate wallet, paste Other, Start."
-            self.messages_out.value = ""
+        self._render_check_cards()
 
     # ------------------------------------------------------------------ conversation lifecycle
     def gen_my_wallet(self, widget, **kwargs):
@@ -482,16 +525,38 @@ class SOS69069MsgApp(toga.App):
             "Generate a new wallet to start clean."
         )
         self.check_status.text = "No active conversation"
-        self.messages_out.value = ""
 
     # ------------------------------------------------------------------ CHECK
     async def do_check(self, widget, **kwargs):
-        if not self.conv or self.conv.other == "0x" + "00" * 20:
-            self.check_status.text = "Start a conversation first (SETUP)"
+        try:
+            my = normalize_address((self.check_my_in.value or "").strip())
+            other = normalize_address((self.check_other_in.value or "").strip())
+        except Exception as e:
+            self.check_status.text = f"Bad address: {e}"
+            return
+        if not my or not other:
+            self.check_status.text = "Enter both My and Other address"
             return
         if self._refreshing and time.monotonic() - self._refresh_started < 90:
             self.check_status.text = "Already scanning…"
             return
+
+        # If the pair changed, update it in memory; only persist (and allow
+        # SEND) if My still matches the wallet we hold the private key for.
+        have_key_for_my = bool(self.conv) and my == self.conv.my_address.lower()
+        if not have_key_for_my:
+            self.check_status.text = (
+                "Reading a different My address (no private key here) — "
+                "you can view, but SEND needs the key from SETUP."
+            )
+        if not self.conv or my != self.conv.my_address.lower() or other != self.conv.other_address.lower():
+            self.inbox = Inbox(str(self.inbox_path))
+            self.check_page = 1
+            if have_key_for_my and other != self.conv.other_address.lower():
+                self.conv = start_pair(self.conv.my, other)
+                self.pair_store.save(self.conv)
+        self._view_my = my
+
         self._refreshing = True
         self._refresh_started = time.monotonic()
         self.check_status.text = "Scanning My + Other…"
@@ -506,12 +571,12 @@ class SOS69069MsgApp(toga.App):
             if frm is None:
                 self.inbox.last_block = None  # full lookback on manual CHECK
 
-            my, other = self.conv.my_address, self.conv.other_address
             for name, client in self._check_backends():
                 try:
                     new = await asyncio.to_thread(
                         sync_pair, client, my, other, self.inbox, frm, progress)
-                    self.messages_out.value = self.inbox.render(my)
+                    self.check_page = 1
+                    self._render_check_cards()
                     total = len(self.inbox.messages) + len(self.inbox.pending())
                     if total == 0:
                         self.check_status.text = (
@@ -531,6 +596,112 @@ class SOS69069MsgApp(toga.App):
             self.check_status.text = f"Error: {type(e).__name__}: {e}"
         finally:
             self._refreshing = False
+
+    # ------------------------------------------------------------------ CHECK cards / pagination
+    def _build_card(self, e: dict):
+        rows = [_clabel(e["text"], color=TXT, size=15, bold=True)]
+        rows.append(_clabel(e["address"], color=GOLD, size=13, bold=True))
+        if e["tx"]:
+            rows.append(_clabel(f"tx{e['tx']}", color=BLUE, size=12))
+        if e["block"] is not None:
+            rows.append(_clabel(f"block {e['block']} · {e['when']}", color=MUTED, size=12))
+        if e["pending"]:
+            rows.append(_clabel("⏳ NOT submitted yet", color=MUTED, size=13, bold=True))
+        else:
+            rows.append(_clabel(f"TRUST Received 1 SOS · #{e['code']}", color=GREEN, size=13, bold=True))
+        rows.append(toga.Button(
+            f"REPLY (start conv {e['reply_id']})",
+            on_press=self._make_reply_handler(e),
+            style=_pack(pad=(6, SIDE, 10, SIDE), color=GOLD, background_color=BG,
+                        font_size=13, font_weight="bold", height=40),
+        ))
+        rows.append(toga.Box(style=_pack(height=1, background_color=GREY, pad=(6, 0, 6, 0))))
+        return _col(rows)
+
+    def _make_reply_handler(self, e: dict):
+        def handler(widget, **kw):
+            self.check_reply_in.value = f"#{e['code']}"
+            self.check_msg_in.focus()
+        return handler
+
+    def _render_check_cards(self):
+        my_view = getattr(self, "_view_my", None) or (self.conv.my_address if self.conv else "")
+        entries = self.inbox.entries(my_view)
+        pages = max(1, -(-len(entries) // 10))
+        self.check_page = max(1, min(self.check_page, pages))
+        start = (self.check_page - 1) * 10
+        page_entries = entries[start:start + 10]
+        for child in list(self.cards_box.children):
+            self.cards_box.remove(child)
+        if not page_entries:
+            self.cards_box.add(_label(
+                "No messages yet.\nEach side posts to their own address.\n"
+                "Type below and tap SEND, then RELAY.", size=14))
+        for e in page_entries:
+            self.cards_box.add(self._build_card(e))
+        self.page_label.text = f"Page {self.check_page} / {pages}"
+
+    def check_prev_page(self, widget, **kwargs):
+        if self.check_page > 1:
+            self.check_page -= 1
+            self._render_check_cards()
+
+    def check_next_page(self, widget, **kwargs):
+        self.check_page += 1
+        self._render_check_cards()
+
+    def _on_check_msg_change(self, widget, **kwargs):
+        n = len(widget.value or "")
+        self.check_count_label.text = f"{n}/{MAX_METADATA_LENGTH} characters"
+
+    async def check_send(self, widget, **kwargs):
+        try:
+            if not self.conv or self.conv.other == "0x" + "00" * 20:
+                raise ValueError("Start a conversation first (SETUP)")
+            my_field = normalize_address((self.check_my_in.value or "").strip())
+            if my_field != self.conv.my_address.lower():
+                raise ValueError("My address here doesn't match the key on this device (see SETUP)")
+            text = (self.check_msg_in.value or "").strip()
+            if not text:
+                raise ValueError("Type a message first")
+            key = self.conv.my
+            ph, meta, sig = prepare_and_sign(
+                key, text, reply_code=self.check_reply_in.value or "")
+            if not verify_record(key.address, key.address, ph, meta, sig):
+                raise RuntimeError("Local signature check failed")
+            call = build_record_signature_call(key.address, key.address, ph, sig, meta)
+            record = json.dumps({
+                "to": call["to"], "chainId": CHAIN_ID, "function": call["function"],
+                "signer": call["args"][0], "intendedTo": call["args"][1],
+                "payloadHash": _hex(ph), "signature": _hex(sig), "metadata": meta,
+            }, indent=2)
+            self.signed_out.value = record
+            self.relay_in.value = record
+            self.inbox.add_pending(_hex(ph), meta)
+            self.check_page = 1
+            self._render_check_cards()
+            code = short_code(_hex(ph))
+            self.check_msg_in.value = ""
+            self.check_reply_in.value = ""
+            self.check_count_label.text = f"0/{MAX_METADATA_LENGTH} characters"
+
+            try:
+                relayer = self._active_relayer()
+            except Exception:
+                relayer = None
+            if relayer:
+                self.check_send_status.text = f"Signed #{code} — submitting…"
+                rpc = self._rpc()
+                cap = float(self.settings["max_fee_gwei"])
+                tx = await asyncio.to_thread(submit, rpc, relayer, parse_record(record), cap)
+                self.last_tx_link = f"https://etherscan.io/tx/{tx}"
+                self.inbox.mark_submitted(_hex(ph), tx)
+                self._render_check_cards()
+                self.check_send_status.text = f"Sent ✔  #{code}\n{self.last_tx_link}"
+            else:
+                self.check_send_status.text = f"Signed ✔  #{code} — open RELAY and Submit"
+        except Exception as e:
+            self.check_send_status.text = f"Error: {e}"
 
     # ------------------------------------------------------------------ SEND
     def sign_message(self, widget, **kwargs):
@@ -556,7 +727,8 @@ class SOS69069MsgApp(toga.App):
             self.signed_out.value = record
             self.relay_in.value = record
             self.inbox.add_pending(_hex(ph), meta)
-            self.messages_out.value = self.inbox.render(key.address)
+            self.check_page = 1
+            self._render_check_cards()
             code = short_code(_hex(ph))
             self.send_status.text = f"Signed ✔  #{code}  (self-post) — open RELAY and Submit"
             self.msg_in.value = ""
@@ -602,7 +774,7 @@ class SOS69069MsgApp(toga.App):
             if ph:
                 self.inbox.mark_submitted(ph, tx)
                 if self.conv:
-                    self.messages_out.value = self.inbox.render(self.conv.my_address)
+                    self._render_check_cards()
         except Exception as e:
             self.relay_status.text = f"Error: {type(e).__name__}: {e}"
 
